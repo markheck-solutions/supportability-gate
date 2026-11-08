@@ -1,0 +1,396 @@
+"""Write authoritative deterministic JSON and Markdown derived from it."""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import asdict, dataclass
+from html import escape
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+from supportability_gate.quality_profile import decision_payload, provenance_payload
+
+if TYPE_CHECKING:
+    from supportability_gate.architecture_policy import ArchitectureResult
+    from supportability_gate.complexity_metrics import RuffCommandRecord, RuffDiagnostic
+    from supportability_gate.complexity_policy import FunctionDecision
+    from supportability_gate.function_changes import ChangedFileAssessment
+    from supportability_gate.git_changes import CommandRecord, RepositoryIdentity
+    from supportability_gate.modularity_policy import ModularityResult
+    from supportability_gate.quality_profile import QualityEvidence
+    from supportability_gate.review_evidence import ReviewEvidence
+
+STANDARD_SHA256 = "81653c5057c1555f8b6d41c6e5999d0b54caa178a2ca97a07216147ec16133e2"
+
+
+@dataclass(frozen=True)
+class TechnicalError:
+    """Stable fail-closed error evidence."""
+
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    """Complete typed evidence rendered by reporting only."""
+
+    identity: RepositoryIdentity | None
+    contract_path: str
+    contract_blob_sha: str | None
+    contract_sha256: str | None
+    production_paths: tuple[str, ...]
+    high_risk_paths: tuple[str, ...]
+    gate_coverage: tuple[tuple[str, tuple[str, ...]], ...]
+    changed_files: tuple[ChangedFileAssessment, ...]
+    responsibility_targets: tuple[str, ...]
+    unbounded_production_paths: tuple[str, ...]
+    functions: tuple[FunctionDecision, ...]
+    ruff_diagnostics: tuple[RuffDiagnostic, ...]
+    technical_errors: tuple[TechnicalError, ...]
+    policy_blocks: tuple[str, ...]
+    overall_result: str
+    tool_versions: dict[str, str]
+    git_commands: tuple[CommandRecord, ...]
+    ruff_commands: tuple[RuffCommandRecord, ...]
+    review_evidence: ReviewEvidence | None = None
+    language: str | None = None
+    architecture: ArchitectureResult | None = None
+    modularity: ModularityResult | None = None
+    quality_profile: QualityEvidence | None = None
+    review_evidence_binding: dict[str, object] | None = None
+
+
+def _span_metric(metric: object | None) -> dict[str, Any] | None:
+    if metric is None:
+        return None
+    span = metric.span  # type: ignore[attr-defined]
+    return {
+        "complexity": metric.complexity,  # type: ignore[attr-defined]
+        "end_line": span.end_line,
+        "path": span.path,
+        "qualified_name": span.qualified_name,
+        "start_line": span.start_line,
+    }
+
+
+def _decision_payload(decision: FunctionDecision) -> dict[str, Any]:
+    return {
+        "base": _span_metric(decision.base),
+        "decision": decision.decision,
+        "ending_complexity": decision.head.complexity if decision.head else None,
+        "head": _span_metric(decision.head),
+        "next_target": decision.next_target,
+        "remaining_debt": decision.remaining_debt,
+        "remaining_gap": decision.remaining_debt,
+        "starting_complexity": decision.base.complexity if decision.base else None,
+        "state": decision.state,
+    }
+
+
+def _change_payload(assessment: ChangedFileAssessment) -> dict[str, Any]:
+    return {
+        "base_production": assessment.base_production,
+        "changed_head_lines": list(assessment.changed_head_lines),
+        "complexity_assessed": assessment.complexity_assessed,
+        "head_production": assessment.head_production,
+        "new_path": assessment.change.new_path,
+        "old_path": assessment.change.old_path,
+        "status": assessment.change.status,
+    }
+
+
+def _identity_payload(identity: RepositoryIdentity | None) -> dict[str, str | None]:
+    return {
+        "base_sha": identity.base_sha if identity else None,
+        "base_tree_sha": identity.base_tree_sha if identity else None,
+        "head_sha": identity.head_sha if identity else None,
+        "head_tree_sha": identity.head_tree_sha if identity else None,
+        "remote": identity.remote if identity else None,
+    }
+
+
+def result_payload(result: EvaluationResult) -> dict[str, Any]:
+    """Convert typed evidence to the authoritative schema."""
+    functions = [_decision_payload(item) for item in result.functions]
+    touched = [item["head"]["qualified_name"] for item in functions if item["head"] is not None]
+    touched_identities = {
+        (item["head"]["path"], item["head"]["qualified_name"])
+        for item in functions
+        if item["head"] is not None
+    }
+    renames = [
+        {"new_path": item.change.new_path, "old_path": item.change.old_path}
+        for item in result.changed_files
+        if item.change.status == "RENAMED"
+    ]
+    commands = [asdict(item) for item in result.git_commands]
+    commands.extend(asdict(item) for item in result.ruff_commands)
+    identity = _identity_payload(result.identity)
+    architecture = result.architecture
+    architecture_payload = (
+        {
+            "adapter": architecture.adapter,
+            "blocks": list(architecture.blocks),
+            "covered_paths": list(architecture.covered_paths),
+            "edges": [asdict(edge) for edge in architecture.edges],
+            "executed": architecture.executed,
+            "nodes": list(architecture.nodes),
+        }
+        if architecture
+        else None
+    )
+    changed_production = sorted(
+        {
+            path
+            for item in result.changed_files
+            for path, production in (
+                (item.change.old_path, item.base_production),
+                (item.change.new_path, item.head_production),
+            )
+            if path and production
+        }
+    )
+    graph_citations = (
+        [
+            f"{edge.source}:{edge.line}->{edge.target}"
+            for edge in architecture.edges
+            if edge.internal
+        ]
+        if architecture
+        else []
+    )
+    architecture_verdict = (
+        "BLOCK" if architecture and architecture.blocks else "PASS" if architecture else "MISSING"
+    )
+    modularity = result.modularity
+    modularity_payload = (
+        {
+            "blocks": list(modularity.blocks),
+            "changed_paths": list(modularity.changed_paths),
+            "coupling_edges": [asdict(edge) for edge in modularity.coupling_edges],
+            "coverage": [asdict(item) for item in modularity.coverage],
+            "justifications": [asdict(item) for item in modularity.justifications],
+            "new_paths": list(modularity.new_paths),
+        }
+        if modularity
+        else None
+    )
+    return {
+        "base_contract_blob_sha": result.contract_blob_sha,
+        "architecture": architecture_payload,
+        "base_sha": identity["base_sha"],
+        "base_tree_sha": identity["base_tree_sha"],
+        "changed_files": [_change_payload(item) for item in result.changed_files],
+        "dependency_direction_explanation": (
+            f"{architecture_verdict}: verified import graph {graph_citations}; "
+            f"changed production paths {changed_production}."
+        ),
+        "commands": commands,
+        "contract_path": result.contract_path,
+        "contract_sha256": result.contract_sha256,
+        "head_sha": identity["head_sha"],
+        "head_tree_sha": identity["head_tree_sha"],
+        "high_risk_paths": list(result.high_risk_paths),
+        "language": result.language,
+        "modularity": modularity_payload,
+        "gate_coverage": [
+            {"adapter": adapter, "paths": list(paths)} for adapter, paths in result.gate_coverage
+        ],
+        "functions": functions,
+        "overall_result": result.overall_result,
+        "policy_blocks": list(result.policy_blocks),
+        "production_paths": list(result.production_paths),
+        "responsibility_targets": list(result.responsibility_targets),
+        "quality_profile": decision_payload(result.quality_profile)
+        if result.quality_profile
+        else None,
+        "rename_bindings": renames,
+        "repository_remote": identity["remote"],
+        "review_evidence": result.review_evidence,
+        "review_evidence_binding": result.review_evidence_binding,
+        "review_evidence_path": ".supportability-review.toml",
+        "ruff_diagnostics": [
+            asdict(item)
+            for item in result.ruff_diagnostics
+            if (item.path, item.qualified_name) in touched_identities
+        ],
+        "schema_version": "1.0",
+        "standard_sha256": STANDARD_SHA256,
+        "technical_errors": [asdict(item) for item in result.technical_errors],
+        "tool_versions": dict(sorted(result.tool_versions.items())),
+        "touched_qualified_functions": sorted(touched),
+        "unbounded_production_paths": list(result.unbounded_production_paths),
+    }
+
+
+def _escape(value: object) -> str:
+    return str(value).replace("|", "\\|")
+
+
+def markdown_from_json(payload: dict[str, Any]) -> str:
+    """Derive Markdown only from the authoritative JSON object."""
+    lines = [
+        "# Supportability Complexity Result",
+        "",
+        f"- Overall result: `{payload['overall_result']}`",
+        f"- Repository: `{payload['repository_remote']}`",
+        f"- Base: `{payload['base_sha']}`",
+        f"- Head: `{payload['head_sha']}`",
+        "",
+        "| Function | Start | End | Gap | Next target | Decision |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for item in payload["functions"]:
+        metric = item["head"] or item["base"]
+        lines.append(
+            "| {name} | {base} | {head} | {gap} | {target} | {decision} |".format(
+                name=_escape(metric["qualified_name"]),
+                base=item["base"]["complexity"] if item["base"] else "—",
+                head=item["head"]["complexity"] if item["head"] else "—",
+                gap=item["remaining_gap"] if item["remaining_gap"] is not None else "—",
+                target=item["next_target"] if item["next_target"] is not None else "—",
+                decision=item["decision"],
+            )
+        )
+    if payload["technical_errors"]:
+        lines.extend(["", "## Technical errors", ""])
+        lines.extend(
+            f"- `{item['code']}`: {item['message']}" for item in payload["technical_errors"]
+        )
+    if payload["policy_blocks"]:
+        lines.extend(["", "## Policy blocks", ""])
+        lines.extend(f"- `{item}`" for item in payload["policy_blocks"])
+    if payload["review_evidence"]:
+        lines.extend(
+            [
+                "",
+                "## Structured review evidence",
+                "",
+                "```json",
+                json.dumps(
+                    {
+                        name: value
+                        for name, value in payload["review_evidence"].items()
+                        if name != "review_handoff"
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "```",
+            ]
+        )
+    lines.extend(["", "Derived from `complexity-result.json`.", ""])
+    return "\n".join(lines)
+
+
+def _failure_explanation(code: str) -> str:
+    if code.startswith("FUNCTION_COMPLEXITY:"):
+        return (
+            "The function violates its applicable complexity target. Next action: inspect its "
+            "recorded base/head metrics in complexity-result.json and simplify its responsibility. "
+            "New and previously compliant functions must stay at 10 or lower; touched legacy "
+            "functions above 10 must decrease."
+        )
+    family, _, location = code.partition(":")
+    if family in {"MISSING_REVIEW_EVIDENCE", "INSUFFICIENT_REVIEW_EVIDENCE"} and re.fullmatch(
+        r"separation_of_concerns\.boundaries(?:\[(?:0|[1-9][0-9]*)\]"
+        r"(?:\.(?:path|kind|symbol|before|after))?)?",
+        location,
+    ):
+        return (
+            "Required responsibility evidence is missing, blank, or does not match the changed "
+            "function, component, or module identities. Next action: compare "
+            "separation_of_concerns.boundaries with the changed identities and supply the "
+            "required records and fields. This result does not establish an architectural defect."
+        )
+    if code == "STALE_OWNER_AUTHORIZATION":
+        return (
+            "The available authorization does not apply to this run's base/head. Next action: "
+            "have the owner review the current scope and, if approved, supply authorization bound "
+            "to this base/head. Other checks still apply."
+        )
+    if code.startswith("STAGE_FAILURE:"):
+        _, _, remainder = code.partition(":")
+        stage, _, original = remainder.partition(":")
+        return (
+            f"The `{stage}` stage failed with the original code `{original}`. Diagnosis is "
+            "unavailable here; inspect the retained diagnostic artifact for its bounded, "
+            "sanitized stdout/stderr and exact run identity."
+        )
+    return "Diagnosis unavailable. Inspect the original code and cited evidence."
+
+
+def _evidence_classes(entry: dict[str, object], sources: list[str]) -> dict[str, list[str]]:
+    declarations = [
+        source
+        for source in sources
+        if ":review_evidence." in source and "review_evidence_binding" not in source
+    ]
+    measured = [source for source in sources if source not in declarations]
+    return {
+        "authenticated_owner_attestation": [],
+        "author_declaration": declarations,
+        "measured_fact": measured,
+    }
+
+
+def standard_result_summary(entry: dict[str, object] | None, error: str | None = None) -> str:
+    """Present an already validated entry, or only its validation failure."""
+    if entry is None:
+        return (
+            "## Supportability result\n\n"
+            f"<pre>{escape(error or '')}</pre>\n\nDiagnosis unavailable.\n"
+        )
+    lines = [
+        f"## {entry['check_context']}",
+        "",
+        f"Result: **{entry['result']}**",
+        "",
+        "Derived from validated standard-results.json for this run.",
+    ]
+    for field in ("policy_blocks", "technical_errors"):
+        for code in cast(list[str], entry[field]):
+            lines.extend(["", f"<pre>{escape(code)}</pre>", "", _failure_explanation(code)])
+    source_rows = cast(list[str], entry["evidence_sources"])
+    sources = "\n".join(source_rows)
+    lines.extend(["", "Evidence:", "", f"<pre>{escape(sources)}</pre>", ""])
+    classes = _evidence_classes(entry, source_rows)
+    lines.extend(
+        [
+            "Evidence classes:",
+            "",
+            "- deterministic_decision: this validated lane result",
+            "- measured_fact: " + (", ".join(classes["measured_fact"]) or "none"),
+            "- author_declaration: " + (", ".join(classes["author_declaration"]) or "none"),
+            "- authenticated_owner_attestation: "
+            + (", ".join(classes["authenticated_owner_attestation"]) or "none asserted"),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_reports(result: EvaluationResult, output_directory: Path) -> bytes:
+    """Write byte-stable JSON then derive Markdown from parsed JSON."""
+    output_directory.mkdir(parents=True, exist_ok=True)
+    payload = result_payload(result)
+    json_bytes = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    (output_directory / "complexity-result.json").write_bytes(json_bytes)
+    if result.quality_profile:
+        provenance = (
+            json.dumps(
+                provenance_payload(result.quality_profile), indent=2, sort_keys=True
+            ).encode()
+            + b"\n"
+        )
+        (output_directory / "quality-provenance.json").write_bytes(provenance)
+    authoritative = json.loads(json_bytes)
+    (output_directory / "complexity-result.md").write_bytes(
+        markdown_from_json(authoritative).encode("utf-8")
+    )
+    return json_bytes

@@ -1,0 +1,46 @@
+name: Product maintenance
+description: Describe a bounded Supportability Gate change and its required delivery evidence.
+title: "Maintenance: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and affected product behavior
+      description: Describe the observable problem in the Gate or its documentation. Keep consumer incidents as linked evidence rather than product requirements.
+    validations:
+      required: true
+  - type: textarea
+    id: intended-outcome
+    attributes:
+      label: Intended outcome
+      description: State the resulting product behavior and the exact condition for completion.
+    validations:
+      required: true
+  - type: textarea
+    id: authority-and-scope
+    attributes:
+      label: Owner authorization and scope
+      description: Identify current owner authority, affected responsibilities, authorized files, and excluded work. A historical roadmap or closed project does not authorize this task.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance and direct evidence
+      description: List required source, parser/example, local, protected-check, merge, and publication proof appropriate to the change. Preserve immutable policy and zero bypass.
+    validations:
+      required: true
+  - type: textarea
+    id: documentation
+    attributes:
+      label: Documentation and wiki impact
+      description: Name affected product topics and required canonical-source updates. Record whether manual wiki publication and rendered verification are part of completion.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence-record
+    attributes:
+      label: Delivery record and remaining limits
+      description: Record actual commit, PR, checks, merge, source/workflow boundary, publication, and cleanup evidence. Separate measured results, declarations, assumptions, and unknowns.
+    validations:
+      required: false

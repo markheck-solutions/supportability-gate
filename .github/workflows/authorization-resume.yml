@@ -1,0 +1,15 @@
+name: Retired Supportability Authorization Continuation
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  retired:
+    name: No authorization comment required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Explain the current policy
+        run: echo "The shared Gate evaluates technical evidence directly. No owner review comment or authorization receiver is required."

@@ -1,0 +1,54 @@
+schema_version = "1.0"
+module_boundaries = []
+
+[behavior]
+intended_behavior = "Prepare a privacy-clean public showcase release: neutralize the internal consumer name in the frozen roadmap under a synchronized hash amendment, exclude private historical evidence archives and audit records from the public tree, and retarget workflow gate-source checkouts to the repository itself."
+proof = "Full Python 3.12 source-proof suite, source-integrity static controls and conformance, and a zero-leak identifier scan executed on the exact public tree commit."
+
+[characterization]
+captured_behavior = "All governed production CLI, complexity, contract, characterization, refactor, quality, and standard-result behaviors under src/supportability_gate remain byte-for-byte identical between the private source repository and this public showcase tree."
+proof = "Zero production source files or characterization scenarios changed; the full test suite passes unchanged on the public tree."
+
+[separation_of_concerns]
+before = "The showcase tree carried the private dated evidence archive, a private ruleset-context JSON, an internal public-readiness audit document, frozen roadmap wording naming a private consumer, and workflow checkouts pinned to a private repository."
+after = "The public tree carries only the product, its tests, and self-referential workflows; private evidence and audit artifacts remain in the private source repository, and the roadmap privacy amendment is synchronized with its hash locks."
+boundaries = []
+
+[architecture]
+dependency_direction = "No production Python modules under src/supportability_gate were modified; inward package dependency layers remain unchanged."
+reviewed_paths = [
+    ".gitignore",
+    ".supportability-review.toml",
+    "AGENTS.md",
+    "README.md",
+    "docs/fixed_roadmap.md",
+    "docs/product_completion_contract.md",
+    "docs/product/CLI-Reference.md",
+    "docs/product/Getting-Started.md",
+    "docs/qualification/README.md",
+    "docs/source_integrity_manifest.json",
+    ".github/workflows/organization-required.yml",
+    ".github/workflows/source-integrity.yml",
+    "tests/data/introduction-authorization-native-negative-v1.json",
+    "tests/hosted_authorization_resume.py",
+    "tests/test_authorization_resume.py",
+]
+
+[responsibility_boundary]
+path = "docs/source_integrity_manifest.json"
+owns = "Declaring the public repository identity and the immutable-file hash locks that source-integrity verification enforces."
+does_not_own = "Executable policy evaluation, characterization capture, or GitHub Actions workflow execution."
+
+[incremental_refactor]
+target = "Publish a privacy-clean public showcase without altering production Gate behavior or any private repository."
+completed_step = "Exclude private archives and audit records, neutralize the frozen roadmap consumer name under a synchronized hash amendment, and retarget workflow gate-source checkouts to the repository itself."
+
+[review_handoff]
+summary = "DERIVED_FROM_AUTHENTICATED_EVIDENCE"
+remaining_risks = ["DERIVED_FROM_AUTHENTICATED_EVIDENCE"]
+
+[human_review]
+naming = "Neutral roadmap wording and a manifest naming the public repository keep every published identifier self-referential."
+cohesion = "Changes are confined to documentation, workflow checkout targets, repository identity metadata, and neutral fixture identifiers."
+intended_behavior = "All Supportability Gate, Source Validation, and Source Integrity checks remain green on the public tree with zero private identifiers."
+reviewability = "Author declaration only; production code under src/supportability_gate is completely untouched."

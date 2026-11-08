@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Historical PR and qualification evidence bundles
+*.bundle
+docs/history/**/*.zip
+docs/qualification/*.zip
+supportability-evidence-*.zip
+quality-profile-*.zip
+characterization-base-*.zip
+characterization-head-*.zip
+run-logs.zip
+
+# Local working proposals
+docs/proposals/

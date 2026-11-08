@@ -1,0 +1,285 @@
+[
+  {
+    "input": "approved-content",
+    "output": [
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 1,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 2,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 3,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 4,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 5,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 6,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 7,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 8,
+        "technical_errors": []
+      }
+    ]
+  },
+  {
+    "input": "missing-target",
+    "output": [
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 1,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 2,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 3,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 4,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [
+          "INCOMPATIBLE_POST_CHANGE_BEHAVIOR:sample"
+        ],
+        "result": "BLOCK",
+        "standard": 5,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "TECHNICAL_FAILURE",
+        "standard": 6,
+        "technical_errors": [
+          "REFACTOR_RESULT_BINDING_MISMATCH"
+        ]
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 7,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "TECHNICAL_FAILURE",
+        "standard": 8,
+        "technical_errors": [
+          "REFACTOR_RESULT_BINDING_MISMATCH"
+        ]
+      }
+    ]
+  },
+  {
+    "input": "stale-approval",
+    "output": [
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 1,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 2,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 3,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 4,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [
+          "INCOMPATIBLE_POST_CHANGE_BEHAVIOR:sample"
+        ],
+        "result": "BLOCK",
+        "standard": 5,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "TECHNICAL_FAILURE",
+        "standard": 6,
+        "technical_errors": [
+          "REFACTOR_RESULT_BINDING_MISMATCH"
+        ]
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 7,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "TECHNICAL_FAILURE",
+        "standard": 8,
+        "technical_errors": [
+          "REFACTOR_RESULT_BINDING_MISMATCH"
+        ]
+      }
+    ]
+  },
+  {
+    "input": "wrong-scope",
+    "output": [
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 1,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 2,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 3,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 4,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [
+          "INCOMPATIBLE_POST_CHANGE_BEHAVIOR:sample"
+        ],
+        "result": "BLOCK",
+        "standard": 5,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "TECHNICAL_FAILURE",
+        "standard": 6,
+        "technical_errors": [
+          "REFACTOR_RESULT_BINDING_MISMATCH"
+        ]
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 7,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "TECHNICAL_FAILURE",
+        "standard": 8,
+        "technical_errors": [
+          "REFACTOR_RESULT_BINDING_MISMATCH"
+        ]
+      }
+    ]
+  },
+  {
+    "input": "source-control",
+    "output": [
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 1,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 2,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 3,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 4,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 5,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 6,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 7,
+        "technical_errors": []
+      },
+      {
+        "policy_blocks": [],
+        "result": "PASS",
+        "standard": 8,
+        "technical_errors": []
+      }
+    ]
+  }
+]

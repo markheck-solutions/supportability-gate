@@ -1,0 +1,1864 @@
+"""Define and verify fixed GitHub-hosted stack-native quality profiles."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import io
+import json
+import posixpath
+import re
+import tokenize
+import zlib
+from dataclasses import asdict, dataclass, replace
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlsplit
+
+from supportability_gate import contract, git_changes
+
+if TYPE_CHECKING:
+    from tree_sitter import Node
+
+    from supportability_gate.function_changes import ChangedFileAssessment
+
+SCHEMA_VERSION = "quality-gates.v6"
+TIMEOUT_SECONDS = 600
+_FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_SUPPRESSION_PREFIX = "suppression:"
+_SUPPRESSION_SCOPES = frozenset({"blanket", "narrow", "region"})
+_SUPPRESSION_SIDES = frozenset({"base", "head"})
+_SUPPRESSION_RULES = {
+    "ruff-file-noqa": ("python.ruff-lint.v1", "blanket"),
+    "ruff-file-noqa-codes": ("python.ruff-lint.v1", "region"),
+    "ruff-line-noqa": ("python.ruff-lint.v1", "narrow"),
+    "mypy-ignore-errors": ("python.mypy-strict.v1", "blanket"),
+    "mypy-file-control": ("python.mypy-strict.v1", "region"),
+    "mypy-line-ignore": ("python.mypy-strict.v1", "narrow"),
+    "mypy-module-ignore": ("python.mypy-strict.v1", "blanket"),
+    "typescript-ts-nocheck": ("typescript.typecheck.v1", "blanket"),
+    "typescript-ts-ignore": ("typescript.typecheck.v1", "narrow"),
+    "eslint-disable-next-line": ("typescript.eslint.v1", "narrow"),
+    "eslint-disable-region": ("typescript.eslint.v1", "region"),
+}
+_RUFF_FILE_NOQA = re.compile(r"^#\s*(?:ruff|flake8)\s*:\s*noqa(?:\s*:\s*(.+))?\s*$")
+_RUFF_LINE_NOQA = re.compile(r"^#\s*noqa(?:\s*:\s*(.+))?\s*$")
+_MYPY_IGNORE_ERRORS = re.compile(r"^#\s+mypy\s*:\s*ignore-errors\s*$")
+_MYPY_FILE_CONTROL = re.compile(r"^#\s+mypy\s*:")
+_MYPY_LINE_IGNORE = re.compile(r"^#\s*type\s*:\s*ignore(?:\[[^\]]+\])?\s*$")
+_TYPESCRIPT_NO_CHECK = re.compile(r"(?i)^//\s*@ts-nocheck\s*$")
+_TYPESCRIPT_LINE_IGNORE = re.compile(r"(?i)^//\s*@ts-(?:ignore|expect-error)(?:\s.*)?$")
+_ESLINT_DISABLE_NEXT = re.compile(r"eslint-disable-(?:next-)?line\b")
+_ESLINT_DISABLE_REGION = re.compile(r"eslint-disable(?!-(?:next-)?line)\b")
+SOURCE_SUFFIXES = contract.SOURCE_SUFFIXES
+TEST_SUFFIXES = {
+    "python": (".py", ".pyi"),
+    "typescript": (".test.js", ".test.mjs", ".test.cjs", ".test.ts", ".test.mts", ".test.cts"),
+    "mixed": (
+        ".py",
+        ".pyi",
+        ".test.js",
+        ".test.mjs",
+        ".test.cjs",
+        ".test.ts",
+        ".test.mts",
+        ".test.cts",
+    ),
+}
+ASSET_VALIDATORS = {
+    ".css": ("css", "css.utf8.v1"),
+    ".html": ("html", "html.external-script.v1"),
+    ".ico": ("ico", "ico.png-directory.v1"),
+    ".json": ("json", "json.stdlib.v1"),
+    ".md": ("markdown", "markdown.utf8.v1"),
+    ".png": ("png", "png.crc.v1"),
+}
+UNSUPPORTED_ASSET_IDENTITY = ("unsupported", "unsupported.v1")
+ASSET_RESULTS = frozenset({"PASS", "MALFORMED", "UNSUPPORTED"})
+_PNG_BIT_DEPTHS = {
+    0: (1, 2, 4, 8, 16),
+    2: (8, 16),
+    3: (1, 2, 4, 8),
+    4: (8, 16),
+    6: (8, 16),
+}
+_PYTHON_COMMANDS = (
+    (
+        "python.ruff-lint.v1",
+        (
+            "$PYTHON",
+            "-I",
+            "-m",
+            "ruff",
+            "check",
+            "$SOURCE_FILES",
+            "$TEST_FILES",
+            "--select",
+            "E4,E7,E9,F,I,UP",
+            "--line-length",
+            "100",
+            "--target-version",
+            "py312",
+            "--isolated",
+            "--no-cache",
+        ),
+    ),
+    (
+        "python.ruff-format.v1",
+        (
+            "$PYTHON",
+            "-I",
+            "-m",
+            "ruff",
+            "format",
+            "--check",
+            "$SOURCE_FILES",
+            "$TEST_FILES",
+            "--line-length",
+            "100",
+            "--target-version",
+            "py312",
+            "--isolated",
+            "--no-cache",
+        ),
+    ),
+    (
+        "python.c901-touched.v1",
+        (
+            "$PYTHON",
+            "-I",
+            "-m",
+            "ruff",
+            "check",
+            "$SOURCE_FILES",
+            "--select",
+            "C901",
+            "--config",
+            "lint.mccabe.max-complexity = 10",
+            "--target-version",
+            "py312",
+            "--isolated",
+            "--no-cache",
+        ),
+    ),
+    (
+        "python.mypy-strict.v1",
+        (
+            "$PYTHON",
+            "-I",
+            "-m",
+            "mypy",
+            "--config-file",
+            "$OUTPUT/mypy.ini",
+            "--cache-dir",
+            "$OUTPUT/mypy-cache",
+            "$SOURCE_FILES",
+        ),
+    ),
+    (
+        "python.pytest.v1",
+        (
+            "$PYTHON",
+            "-I",
+            "/collector/quality_pytest_entry.py",
+            "-p",
+            "xdist.plugin",
+            "-p",
+            "pytest_cov.plugin",
+            "-p",
+            "quality_pytest_guard",
+            "--dist=load",
+            "--tx=2*popen//python=$PYTHON -I -u /collector/quality_pytest_entry.py --worker",
+            "--max-worker-restart=0",
+            "--cov=src",
+            "--cov-branch",
+            "--cov-config=$OUTPUT/coverage.ini",
+            "--cov-report=",
+            "-q",
+            "-c",
+            "$OUTPUT/pytest.ini",
+            "--rootdir",
+            "$REPOSITORY",
+        ),
+    ),
+    (
+        "python.build-wheel.v1",
+        (
+            "$PYTHON",
+            "-I",
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            "$OUTPUT/wheel",
+        ),
+    ),
+    (
+        "python.import-linter.v1",
+        ("$LINT_IMPORTS", "--config", "$OUTPUT/importlinter.ini", "--no-cache"),
+    ),
+)
+_TYPESCRIPT_COMMANDS = (
+    (
+        "typescript.tool-install.v1",
+        (
+            "$NPM",
+            "install",
+            "--prefix",
+            "$TOOLS",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "eslint@9.39.3",
+            "@typescript-eslint/parser@8.65.0",
+            "prettier@3.9.6",
+            "typescript@5.9.3",
+            "dependency-cruiser@18.1.0",
+        ),
+    ),
+    (
+        "typescript.target-install.v1",
+        ("$NPM", "ci", "--ignore-scripts", "--no-audit", "--no-fund"),
+    ),
+    (
+        "typescript.eslint.v1",
+        (
+            "$TOOLS/node_modules/.bin/eslint",
+            "--config",
+            "$TOOLS/eslint.config.mjs",
+            "--no-config-lookup",
+            "--no-ignore",
+            "--no-inline-config",
+            "$SOURCE_FILES",
+            "$TEST_FILES",
+        ),
+    ),
+    (
+        "typescript.prettier.v1",
+        (
+            "$TOOLS/node_modules/.bin/prettier",
+            "--check",
+            "--config",
+            "$TOOLS/prettier.json",
+            "--no-editorconfig",
+            "--ignore-path",
+            "$TOOLS/prettier.ignore",
+            "$SOURCE_FILES",
+            "$TEST_FILES",
+        ),
+    ),
+    (
+        "typescript.c901-equivalent-touched.v1",
+        (
+            "$TOOLS/node_modules/.bin/eslint",
+            "--config",
+            "$TOOLS/eslint.config.mjs",
+            "--no-config-lookup",
+            "--no-ignore",
+            "--no-inline-config",
+            "--rule",
+            "complexity: [error, 10]",
+            "$SOURCE_FILES",
+            "$TEST_FILES",
+        ),
+    ),
+    (
+        "typescript.typecheck.v1",
+        ("$TOOLS/node_modules/.bin/tsc", "--project", "$OUTPUT/tsconfig-check.json"),
+    ),
+    (
+        "typescript.test.v1",
+        (
+            "$NODE",
+            "--enable-source-maps",
+            "--test",
+            "--experimental-test-coverage",
+            "$COVERAGE_FILES",
+            "--test-reporter=spec",
+            "--test-reporter=lcov",
+            "--test-reporter-destination=stdout",
+            "--test-reporter-destination=$OUTPUT/coverage.lcov",
+            "$TEST_FILES",
+        ),
+    ),
+    (
+        "typescript.build.v1",
+        ("$TOOLS/node_modules/.bin/tsc", "--project", "$OUTPUT/tsconfig-build.json"),
+    ),
+    (
+        "typescript.import-boundaries.v1",
+        (
+            "$TOOLS/node_modules/.bin/depcruise",
+            "--config",
+            "$TOOLS/dependency-cruiser.json",
+            "--ts-config",
+            "$OUTPUT/tsconfig-check.json",
+            "--",
+            "$SOURCE_PATHS",
+        ),
+    ),
+)
+
+_PROOF_KINDS = {
+    "python.ruff-lint.v1": "explicit-source",
+    "python.ruff-format.v1": "explicit-source",
+    "python.c901-touched.v1": "explicit-source",
+    "python.mypy-strict.v1": "config-source",
+    "python.pytest.v1": "runtime-lines",
+    "python.build-wheel.v1": "artifact-members",
+    "python.import-linter.v1": "parsed-source",
+    "typescript.tool-install.v1": "provisioning",
+    "typescript.target-install.v1": "provisioning",
+    "typescript.eslint.v1": "explicit-source",
+    "typescript.prettier.v1": "explicit-source",
+    "typescript.c901-equivalent-touched.v1": "explicit-source",
+    "typescript.typecheck.v1": "config-source",
+    "typescript.test.v1": "runtime-lines",
+    "typescript.build.v1": "compiler-output",
+    "typescript.import-boundaries.v1": "parsed-source",
+}
+
+
+class QualityProfileError(ValueError):
+    """Fail-closed quality-profile evidence error."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """One fixed command result."""
+
+    adapter: str
+    arguments: tuple[str, ...]
+    proof_kind: str
+    observed_paths: tuple[str, ...]
+    zero_statement_paths: tuple[str, ...]
+    executed: bool
+    exit_code: int
+    stderr_sha256: str
+    stdout_sha256: str
+    raw_proof_sha256: str
+    executed_arguments: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AssetReceipt:
+    """One immutable production-asset validation result."""
+
+    path: str
+    kind: str
+    validator: str
+    blob_sha256: str
+    result: str
+
+
+@dataclass(frozen=True)
+class SourceReceipt:
+    """One exact source blob and its trusted zero-statement eligibility."""
+
+    path: str
+    blob_sha: str
+    content_sha256: str
+    zero_statement_eligible: bool
+
+
+@dataclass(frozen=True)
+class SuppressionRecord:
+    """One source-authenticated suppression directive classification."""
+
+    adapter: str
+    line: int
+    path: str
+    reason: str
+    scope: str
+    side: str
+    source_sha256: str
+
+
+@dataclass(frozen=True)
+class QualityEvidence:
+    """Exact immutable quality-profile attestation."""
+
+    base_sha: str
+    changed_paths: tuple[str, ...]
+    commands: tuple[GateResult, ...]
+    exclusions: tuple[str, ...]
+    head_sha: str
+    high_risk_paths: tuple[str, ...]
+    language: str
+    maximum_complexity: int
+    asset_receipts: tuple[AssetReceipt, ...]
+    production_files: tuple[str, ...]
+    source_files: tuple[str, ...]
+    test_files: tuple[str, ...]
+    production_paths: tuple[str, ...]
+    repository: str
+    repository_id: str
+    repository_remote: str
+    run_attempt: str
+    run_id: str
+    runner_environment: str
+    schema_version: str
+    workflow_sha: str
+    job: str
+    artifact_id: str
+    artifact_digest: str
+    capture_sha256: str
+
+
+def encode_suppression_record(record: SuppressionRecord) -> str:
+    """Encode one suppression record as a canonical evidence string."""
+    _validate_suppression_record(record)
+    return _SUPPRESSION_PREFIX + json.dumps(
+        asdict(record), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+
+
+def parse_suppression_record(value: str) -> SuppressionRecord:
+    """Decode one strict canonical suppression record or fail closed."""
+    try:
+        payload = json.loads(value.removeprefix(_SUPPRESSION_PREFIX))
+        if not value.startswith(_SUPPRESSION_PREFIX) or not isinstance(payload, dict):
+            raise ValueError
+        record = SuppressionRecord(**payload)
+        _validate_suppression_record(record)
+        if encode_suppression_record(record) != value:
+            raise ValueError
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise QualityProfileError(
+            "MALFORMED_SUPPRESSION_ANALYSIS", "invalid suppression evidence"
+        ) from error
+    return record
+
+
+def _validate_suppression_record(record: SuppressionRecord) -> None:
+    if (
+        not isinstance(record.adapter, str)
+        or not isinstance(record.path, str)
+        or not record.path
+        or not isinstance(record.reason, str)
+        or _SUPPRESSION_RULES.get(record.reason) != (record.adapter, record.scope)
+        or not isinstance(record.line, int)
+        or isinstance(record.line, bool)
+        or record.line < 1
+        or record.scope not in _SUPPRESSION_SCOPES
+        or record.side not in _SUPPRESSION_SIDES
+        or not isinstance(record.source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", record.source_sha256) is None
+    ):
+        raise ValueError("invalid suppression record")
+
+
+def suppression_policy_blocks(exclusions: tuple[str, ...]) -> tuple[str, ...]:
+    """Return Gate 7 blocks while retaining narrow and base-only records."""
+    blocks: list[str] = []
+    for value in exclusions:
+        if not value.startswith(_SUPPRESSION_PREFIX):
+            blocks.append(f"QUALITY_EXCLUSION_ADDED:{value}")
+            continue
+        record = parse_suppression_record(value)
+        if record.side == "head" and record.scope in {"blanket", "region"}:
+            blocks.append(
+                "QUALITY_BLANKET_SUPPRESSION:"
+                f"{record.adapter}:{record.path}:{record.line}:{record.reason}"
+            )
+    return tuple(sorted(set(blocks)))
+
+
+def _record(
+    adapter: str,
+    line: int,
+    path: str,
+    reason: str,
+    scope: str,
+    side: str,
+    digest: str,
+) -> str:
+    return encode_suppression_record(
+        SuppressionRecord(adapter, line, path, reason, scope, side, digest)
+    )
+
+
+def _python_comments(content: bytes) -> tuple[tuple[int, int, str], ...]:
+    try:
+        return tuple(
+            (token.start[0], token.start[1], token.string)
+            for token in tokenize.tokenize(io.BytesIO(content).readline)
+            if token.type == tokenize.COMMENT
+        )
+    except (IndentationError, SyntaxError, UnicodeDecodeError, tokenize.TokenError) as error:
+        raise QualityProfileError(
+            "MALFORMED_SUPPRESSION_ANALYSIS", "unable to tokenize Python source"
+        ) from error
+
+
+def _python_suppressions(
+    path: str, content: bytes, side: str, adapters: tuple[str, ...]
+) -> tuple[str, ...]:
+    digest = _sha256(content)
+    records: list[str] = []
+    for line, column, comment in _python_comments(content):
+        if "python.ruff-lint.v1" in adapters and (match := _RUFF_FILE_NOQA.fullmatch(comment)):
+            scope = "region" if match.group(1) else "blanket"
+            reason = "ruff-file-noqa-codes" if match.group(1) else "ruff-file-noqa"
+            records.append(_record("python.ruff-lint.v1", line, path, reason, scope, side, digest))
+        elif "python.ruff-lint.v1" in adapters and _RUFF_LINE_NOQA.fullmatch(comment):
+            records.append(
+                _record("python.ruff-lint.v1", line, path, "ruff-line-noqa", "narrow", side, digest)
+            )
+        if "python.mypy-strict.v1" not in adapters:
+            continue
+        if _MYPY_IGNORE_ERRORS.fullmatch(comment):
+            records.append(
+                _record(
+                    "python.mypy-strict.v1",
+                    line,
+                    path,
+                    "mypy-ignore-errors",
+                    "blanket",
+                    side,
+                    digest,
+                )
+            )
+        elif _MYPY_FILE_CONTROL.match(comment):
+            records.append(
+                _record(
+                    "python.mypy-strict.v1",
+                    line,
+                    path,
+                    "mypy-file-control",
+                    "region",
+                    side,
+                    digest,
+                )
+            )
+        elif _MYPY_LINE_IGNORE.fullmatch(comment):
+            scope = "blanket" if column == 0 and line <= 2 and "[" not in comment else "narrow"
+            reason = "mypy-module-ignore" if scope == "blanket" else "mypy-line-ignore"
+            records.append(
+                _record("python.mypy-strict.v1", line, path, reason, scope, side, digest)
+            )
+    return tuple(records)
+
+
+def _typescript_tree(path: str, content: bytes) -> Node:
+    import tree_sitter_typescript
+    from tree_sitter import Language, Parser
+
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise QualityProfileError(
+            "MALFORMED_SUPPRESSION_ANALYSIS", "TypeScript source is not UTF-8"
+        ) from error
+    language = (
+        tree_sitter_typescript.language_tsx()
+        if path.endswith((".jsx", ".tsx"))
+        else tree_sitter_typescript.language_typescript()
+    )
+    return Parser(Language(language)).parse(content).root_node
+
+
+def _typescript_comments(root: Node, content: bytes) -> tuple[tuple[Node, str], ...]:
+    comments: list[tuple[Node, str]] = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "comment":
+            comments.append((node, content[node.start_byte : node.end_byte].decode("utf-8")))
+        else:
+            stack.extend(reversed(node.children))
+    return tuple(sorted(comments, key=lambda item: item[0].start_byte))
+
+
+def _typescript_suppressions(
+    path: str, content: bytes, side: str, adapters: tuple[str, ...]
+) -> tuple[str, ...]:
+    digest = _sha256(content)
+    root = _typescript_tree(path, content)
+    comments = _typescript_comments(root, content)
+    first_code = min(
+        (child.start_byte for child in root.named_children if child.type != "comment"),
+        default=len(content) + 1,
+    )
+    records: list[str] = []
+    for node, comment in comments:
+        line = node.start_point.row + 1
+        if (
+            "typescript.typecheck.v1" in adapters
+            and node.start_byte < first_code
+            and _TYPESCRIPT_NO_CHECK.fullmatch(comment)
+        ):
+            records.append(
+                _record(
+                    "typescript.typecheck.v1",
+                    line,
+                    path,
+                    "typescript-ts-nocheck",
+                    "blanket",
+                    side,
+                    digest,
+                )
+            )
+        elif "typescript.typecheck.v1" in adapters and _TYPESCRIPT_LINE_IGNORE.fullmatch(comment):
+            records.append(
+                _record(
+                    "typescript.typecheck.v1",
+                    line,
+                    path,
+                    "typescript-ts-ignore",
+                    "narrow",
+                    side,
+                    digest,
+                )
+            )
+        if "typescript.eslint.v1" in adapters and _ESLINT_DISABLE_NEXT.search(comment):
+            records.append(
+                _record(
+                    "typescript.eslint.v1",
+                    line,
+                    path,
+                    "eslint-disable-next-line",
+                    "narrow",
+                    side,
+                    digest,
+                )
+            )
+        elif "typescript.eslint.v1" in adapters and _ESLINT_DISABLE_REGION.search(comment):
+            records.append(
+                _record(
+                    "typescript.eslint.v1",
+                    line,
+                    path,
+                    "eslint-disable-region",
+                    "region",
+                    side,
+                    digest,
+                )
+            )
+    return tuple(records)
+
+
+def suppression_records(
+    path: str, content: bytes, side: str, adapters: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Classify pinned suppression grammar without executing candidate code."""
+    if side not in _SUPPRESSION_SIDES:
+        raise QualityProfileError("MALFORMED_SUPPRESSION_ANALYSIS", "invalid source side")
+    if path.endswith((".py", ".pyi")):
+        records = _python_suppressions(path, content, side, adapters)
+    else:
+        records = _typescript_suppressions(path, content, side, adapters)
+    return tuple(sorted(set(records)))
+
+
+def collect_suppression_records(
+    repository: Path,
+    sha: str,
+    side: str,
+    source_files: tuple[str, ...],
+    test_files: tuple[str, ...],
+    records: list[git_changes.CommandRecord],
+) -> tuple[str, ...]:
+    """Scan immutable source and test blobs with their applicable fixed adapters."""
+    collected: list[str] = []
+    for path in sorted(set((*source_files, *test_files))):
+        is_source = path in source_files
+        if path.endswith((".py", ".pyi")):
+            adapters = ("python.ruff-lint.v1",) + (("python.mypy-strict.v1",) if is_source else ())
+        else:
+            adapters = ("typescript.eslint.v1",) + (
+                ("typescript.typecheck.v1",) if is_source else ()
+            )
+        blob = git_changes.read_regular_blob(repository, sha, path, records)
+        collected.extend(suppression_records(path, blob.content, side, adapters))
+    return tuple(sorted(set(collected)))
+
+
+def command_templates(language: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return the immutable approved command templates for one stack."""
+    if language == "python":
+        return _PYTHON_COMMANDS
+    if language == "typescript":
+        return _TYPESCRIPT_COMMANDS
+    if language == "mixed":
+        return (*_PYTHON_COMMANDS, *_TYPESCRIPT_COMMANDS)
+    raise QualityProfileError("UNSUPPORTED_LANGUAGE", f"unsupported language: {language}")
+
+
+def required_adapters(language: str) -> tuple[str, ...]:
+    """Return required gate identities, including fixed TypeScript tool installation."""
+    return tuple(adapter for adapter, _ in command_templates(language))
+
+
+def production_files(
+    repository: Path,
+    head_sha: str,
+    policy: contract.Contract,
+    records: list[git_changes.CommandRecord],
+) -> tuple[str, ...]:
+    """Recompute the complete production manifest from the immutable head tree."""
+    return tuple(
+        item.path
+        for item in git_changes.list_regular_blobs(
+            repository, head_sha, policy.production_paths, records
+        )
+    )
+
+
+def source_files(production: tuple[str, ...], language: str) -> tuple[str, ...]:
+    """Return the language-source subset eligible for fixed code commands."""
+    return tuple(path for path in production if path.endswith(SOURCE_SUFFIXES[language]))
+
+
+def _valid_json(content: bytes) -> bool:
+    def reject_constant(value: str) -> None:
+        raise ValueError(value)
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError("duplicate object key")
+        return value
+
+    try:
+        json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return True
+
+
+def _valid_utf8_text(content: bytes) -> bool:
+    try:
+        return "\0" not in content.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+
+
+_HTML_VOID_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+_HTML_UNASSESSED_TAGS = frozenset({"base", "embed", "iframe", "object", "svg", "math"})
+
+
+def _html_attributes_valid(attributes: list[tuple[str, str | None]]) -> bool:
+    if len(dict(attributes)) != len(attributes):
+        return False
+    for name, value in attributes:
+        if name.startswith("on") or name == "srcdoc":
+            return False
+        normalized = "".join((value or "").split()).lower()
+        if normalized.startswith(("javascript:", "vbscript:", "data:text/html")):
+            return False
+    return True
+
+
+class _HtmlAssetParser(HTMLParser):
+    """Validate explicit HTML structure without admitting embedded executable code."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.valid = True
+        self.tags: list[str] = []
+        self.scripts: list[str] = []
+        self.saw_element = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.saw_element = True
+        self.valid = (
+            self.valid and tag not in _HTML_UNASSESSED_TAGS and _html_attributes_valid(attrs)
+        )
+        values = dict(attrs)
+        if tag == "script":
+            source = values.get("src")
+            self.valid = self.valid and bool(source)
+            if source:
+                self.scripts.append(source)
+        if tag == "meta" and (values.get("http-equiv") or "").lower() == "refresh":
+            self.valid = False
+        if tag not in _HTML_VOID_TAGS:
+            self.tags.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.tags or self.tags[-1] != tag:
+            self.valid = False
+        else:
+            self.tags.pop()
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag not in _HTML_VOID_TAGS:
+            self.valid = False
+
+    def handle_data(self, data: str) -> None:
+        if self.tags and self.tags[-1] == "script" and data.strip():
+            self.valid = False
+
+    def unknown_decl(self, data: str) -> None:
+        self.valid = False
+
+
+def _html_asset(content: bytes) -> _HtmlAssetParser:
+    parser = _HtmlAssetParser()
+    try:
+        parser.feed(content.decode("utf-8"))
+        parser.close()
+    except (UnicodeDecodeError, ValueError, AssertionError):
+        parser.valid = False
+    parser.valid = (
+        parser.valid and _valid_utf8_text(content) and parser.saw_element and not parser.tags
+    )
+    return parser
+
+
+def _valid_html(content: bytes) -> bool:
+    return _html_asset(content).valid
+
+
+def _html_sources_covered(path: str, content: bytes, sources: tuple[str, ...]) -> bool:
+    for reference in _html_asset(content).scripts:
+        try:
+            parsed = urlsplit(reference)
+        except ValueError:
+            return False
+        if parsed.scheme or parsed.netloc or parsed.path.startswith("/"):
+            return False
+        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(parsed.path)))
+        if resolved not in sources or not resolved.endswith(SOURCE_SUFFIXES["typescript"]):
+            return False
+    return True
+
+
+def _valid_ihdr(data: bytes) -> bool:
+    return (
+        len(data) == 13
+        and int.from_bytes(data[:4], "big") > 0
+        and int.from_bytes(data[4:8], "big") > 0
+        and data[8] in _PNG_BIT_DEPTHS.get(data[9], ())
+        and data[10] == 0
+        and data[11] == 0
+        and data[12] in {0, 1}
+    )
+
+
+def _valid_png(content: bytes) -> bool:
+    if not content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset = 8
+    first = True
+    while offset < len(content):
+        if len(content) - offset < 12:
+            return False
+        size = int.from_bytes(content[offset : offset + 4], "big")
+        end = offset + 12 + size
+        if end > len(content):
+            return False
+        kind = content[offset + 4 : offset + 8]
+        data = content[offset + 8 : offset + 8 + size]
+        expected_crc = int.from_bytes(content[offset + 8 + size : end], "big")
+        if zlib.crc32(kind + data) != expected_crc:
+            return False
+        if first and (kind != b"IHDR" or not _valid_ihdr(data)):
+            return False
+        first = False
+        if kind == b"IEND":
+            return size == 0 and end == len(content)
+        offset = end
+    return False
+
+
+def _valid_icon_entry(entry: bytes, payload: bytes) -> bool:
+    width, height = entry[0] or 256, entry[1] or 256
+    return (
+        entry[2:4] == b"\0\0"
+        and int.from_bytes(entry[4:6], "little") in {0, 1}
+        and int.from_bytes(entry[6:8], "little") in {0, 1, 4, 8, 16, 24, 32}
+        and _valid_png(payload)
+        and int.from_bytes(payload[16:20], "big") == width
+        and int.from_bytes(payload[20:24], "big") == height
+    )
+
+
+def _valid_ico(content: bytes) -> bool:
+    if len(content) < 6 or content[:4] != b"\0\0\x01\0":
+        return False
+    count = int.from_bytes(content[4:6], "little")
+    end = 6 + 16 * count
+    if not count or end > len(content):
+        return False
+    for offset in range(6, 6 + 16 * count, 16):
+        entry = content[offset : offset + 16]
+        size = int.from_bytes(entry[8:12], "little")
+        start = int.from_bytes(entry[12:16], "little")
+        if start != end or not size or start + size > len(content):
+            return False
+        end = start + size
+        if not _valid_icon_entry(entry, content[start:end]):
+            return False
+    return end == len(content)
+
+
+def _asset_result(validator: str, content: bytes) -> str:
+    validators = {
+        "css.utf8.v1": _valid_utf8_text,
+        "html.external-script.v1": _valid_html,
+        "ico.png-directory.v1": _valid_ico,
+        "json.stdlib.v1": _valid_json,
+        "markdown.utf8.v1": _valid_utf8_text,
+        "png.crc.v1": _valid_png,
+    }
+    return "PASS" if validators[validator](content) else "MALFORMED"
+
+
+def asset_receipts(
+    repository: Path,
+    head_sha: str,
+    production: tuple[str, ...],
+    sources: tuple[str, ...],
+    records: list[git_changes.CommandRecord],
+) -> tuple[AssetReceipt, ...]:
+    """Validate every non-source production blob at the immutable head."""
+    receipts: list[AssetReceipt] = []
+    for path in production:
+        if path in sources:
+            continue
+        blob = git_changes.read_regular_blob(repository, head_sha, path, records)
+        identity = ASSET_VALIDATORS.get(Path(path).suffix, UNSUPPORTED_ASSET_IDENTITY)
+        kind, validator = identity
+        result = (
+            "UNSUPPORTED"
+            if identity == UNSUPPORTED_ASSET_IDENTITY
+            else _asset_result(validator, blob.content)
+        )
+        if kind == "html" and not _html_sources_covered(path, blob.content, sources):
+            result = "MALFORMED"
+        receipts.append(AssetReceipt(path, kind, validator, _sha256(blob.content), result))
+    return tuple(receipts)
+
+
+def _python_zero_statement_eligible(content: bytes) -> bool:
+    try:
+        module = ast.parse(content)
+    except (SyntaxError, ValueError) as error:
+        raise QualityProfileError("MALFORMED_SOURCE_BLOB", str(error)) from error
+    body = list(module.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        if isinstance(body[0].value.value, str):
+            body.pop(0)
+    return not body
+
+
+def _typescript_zero_statement_eligible(content: bytes) -> bool:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise QualityProfileError("MALFORMED_SOURCE_BLOB", str(error)) from error
+    without_comments = re.sub(r"/\*.*?\*/|//[^\r\n]*", "", text, flags=re.DOTALL)
+    return not without_comments.strip()
+
+
+def source_receipts(
+    repository: Path,
+    head_sha: str,
+    sources: tuple[str, ...],
+    records: list[git_changes.CommandRecord],
+) -> tuple[SourceReceipt, ...]:
+    """Bind source identities and empty-code eligibility to immutable Git blobs."""
+    receipts: list[SourceReceipt] = []
+    for path in sources:
+        blob = git_changes.read_regular_blob(repository, head_sha, path, records)
+        zero = (
+            _python_zero_statement_eligible(blob.content)
+            if path.endswith((".py", ".pyi"))
+            else _typescript_zero_statement_eligible(blob.content)
+        )
+        receipts.append(SourceReceipt(path, blob.object_sha, _sha256(blob.content), zero))
+    return tuple(receipts)
+
+
+def test_files(
+    repository: Path,
+    head_sha: str,
+    language: str,
+    records: list[git_changes.CommandRecord],
+) -> tuple[str, ...]:
+    """Recompute the exact quality test manifest from the immutable head tree."""
+    return tuple(
+        item.path
+        for item in git_changes.list_regular_blobs(repository, head_sha, ("tests",), records)
+        if item.path.endswith(TEST_SUFFIXES[language])
+    )
+
+
+def expected_proof_kind(adapter: str) -> str:
+    """Return the fixed observation type for one approved adapter."""
+    try:
+        return _PROOF_KINDS[adapter]
+    except KeyError as error:
+        raise QualityProfileError("UNAPPROVED_QUALITY_COMMAND", adapter) from error
+
+
+def python_coverage_observation(
+    report: object,
+    source_files: tuple[str, ...],
+    required_targets: tuple[str, ...] = (),
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return files whose required responsibility bodies executed."""
+    if not isinstance(report, dict) or not isinstance(report.get("files"), dict):
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", "coverage files missing")
+    files = report["files"]
+    observed: list[str] = []
+    zero_statement: list[str] = []
+    for path in source_files:
+        item = files.get(path)
+        if item is None:
+            continue
+        if not isinstance(item, dict) or not isinstance(item.get("summary"), dict):
+            raise QualityProfileError("MALFORMED_QUALITY_PROOF", path)
+        summary = item["summary"]
+        statements = summary.get("num_statements")
+        covered = summary.get("covered_lines")
+        if type(statements) is not int or type(covered) is not int:
+            raise QualityProfileError("MALFORMED_QUALITY_PROOF", path)
+        if statements == 0:
+            zero_statement.append(path)
+        elif covered > 0 and _python_runtime_observed(item, path, statements, required_targets):
+            observed.append(path)
+    return tuple(observed), tuple(zero_statement)
+
+
+def _target_span(target: str, path: str) -> tuple[str, int, int] | None:
+    if not target.startswith(f"{path}::"):
+        return None
+    match = re.search(r":([1-9][0-9]*)-([1-9][0-9]*)\Z", target)
+    if match is None:
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", target)
+    start, end = int(match.group(1)), int(match.group(2))
+    if end < start:
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", target)
+    kind = target.split("::", 1)[1].split(":", 1)[0]
+    if kind not in {"component", "function", "module"}:
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", target)
+    return kind, start, end
+
+
+def _required_spans(
+    required_targets: tuple[str, ...], path: str
+) -> tuple[tuple[str, int, int], ...]:
+    return tuple(
+        span for target in required_targets if (span := _target_span(target, path)) is not None
+    )
+
+
+def _python_runtime_observed(
+    item: dict[str, object],
+    path: str,
+    statements: int,
+    required_targets: tuple[str, ...],
+) -> bool:
+    spans = _required_spans(required_targets, path)
+    lines = _runtime_lines(item, "executed_lines", path, required=bool(spans))
+    if lines is None:
+        return True
+    missing = _runtime_lines(item, "missing_lines", path, required=False)
+    if spans and missing is not None:
+        executable = lines | missing
+        return all(
+            not _span_observed(span, executable) or _span_observed(span, lines) for span in spans
+        )
+    if spans:
+        return all(_span_observed(span, lines) for span in spans)
+    return not (statements > 1 and lines == {1})
+
+
+def _runtime_lines(
+    item: dict[str, object], key: str, path: str, *, required: bool
+) -> set[int] | None:
+    value = item.get(key)
+    if value is None:
+        if required:
+            raise QualityProfileError("MALFORMED_QUALITY_PROOF", path)
+        return None
+    if not isinstance(value, list) or any(type(line) is not int or line < 1 for line in value):
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", path)
+    if value != sorted(set(value)):
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", path)
+    return set(value)
+
+
+def _span_observed(span: tuple[str, int, int], lines: set[int] | frozenset[int]) -> bool:
+    kind, start, end = span
+    first = start if kind == "module" or start == end else start + 1
+    return any(first <= line <= end for line in lines)
+
+
+def _lcov_path(value: str, repository: Path) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        try:
+            path = path.resolve().relative_to(repository.resolve())
+        except ValueError as error:
+            raise QualityProfileError("MALFORMED_QUALITY_PROOF", value) from error
+    return path.as_posix()
+
+
+def _lcov_executed_line(line: str, reported: set[int]) -> int | None:
+    fields = line[3:].split(",", 2)
+    if len(fields) < 2 or not all(item.isdigit() for item in fields[:2]):
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", "invalid LCOV line")
+    number = int(fields[0])
+    if number < 1 or number in reported:
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", "invalid LCOV line identity")
+    reported.add(number)
+    return number if int(fields[1]) > 0 else None
+
+
+def _lcov_total(line: str) -> int:
+    value = line[3:]
+    if not value.isdigit():
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", "invalid LCOV total")
+    return int(value)
+
+
+def _store_lcov_record(
+    records: dict[str, tuple[int, int, frozenset[int]]],
+    current: str | None,
+    found: int | None,
+    hits: int | None,
+    executed: set[int],
+    reported: set[int],
+) -> None:
+    if current is None or found is None or hits is None or current in records:
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", "invalid LCOV record")
+    # Node counts ignored/type-only source lines in LF and LH but omits their DA
+    # rows. Reconcile that exact accounting without inventing executed lines.
+    omitted = found - len(reported)
+    if omitted < 0 or hits != len(executed) + omitted:
+        raise QualityProfileError(
+            "MALFORMED_QUALITY_PROOF",
+            f"invalid LCOV totals: {current} LF={found} LH={hits} "
+            f"DA={len(reported)} DA_hits={len(executed)}",
+        )
+    records[current] = (found, hits, frozenset(executed))
+
+
+def _lcov_records(report: str, repository: Path) -> dict[str, tuple[int, int, frozenset[int]]]:
+    records: dict[str, tuple[int, int, frozenset[int]]] = {}
+    current: str | None = None
+    found = hits = None
+    executed: set[int] = set()
+    reported: set[int] = set()
+    for line in report.splitlines():
+        if line.startswith("SF:"):
+            current = _lcov_path(line[3:], repository)
+            found = hits = None
+            executed = set()
+            reported = set()
+        elif line.startswith("DA:"):
+            if (executed_line := _lcov_executed_line(line, reported)) is not None:
+                executed.add(executed_line)
+        elif line.startswith("LF:"):
+            found = _lcov_total(line)
+        elif line.startswith("LH:"):
+            hits = _lcov_total(line)
+        elif line == "end_of_record":
+            _store_lcov_record(records, current, found, hits, executed, reported)
+            current = None
+    if current is not None:
+        raise QualityProfileError("MALFORMED_QUALITY_PROOF", "incomplete LCOV record")
+    return records
+
+
+def typescript_lcov_observation(
+    report: str,
+    source_files: tuple[str, ...],
+    repository: Path,
+    required_targets: tuple[str, ...] = (),
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return TypeScript files whose required responsibility bodies executed."""
+    records = _lcov_records(report, repository)
+    observed = tuple(
+        path
+        for path in source_files
+        if (record := records.get(path)) is not None
+        and bool(record[2])
+        and all(_span_observed(span, record[2]) for span in _required_spans(required_targets, path))
+    )
+    zero_statement = tuple(
+        path for path in source_files if records.get(path, (1, 1, frozenset()))[:2] == (0, 0)
+    )
+    return observed, zero_statement
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _string_tuple(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", f"{field} must be a string list")
+    return tuple(value)
+
+
+def _gate_result(value: object) -> GateResult:
+    if not isinstance(value, dict) or set(value) != {
+        "adapter",
+        "arguments",
+        "proof_kind",
+        "observed_paths",
+        "zero_statement_paths",
+        "executed",
+        "exit_code",
+        "executed_arguments",
+        "stderr_sha256",
+        "stdout_sha256",
+        "raw_proof_sha256",
+    }:
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "invalid command result")
+    if (
+        not isinstance(value["adapter"], str)
+        or not isinstance(value["proof_kind"], str)
+        or type(value["executed"]) is not bool
+        or type(value["exit_code"]) is not int
+        or not isinstance(value["stdout_sha256"], str)
+        or not isinstance(value["stderr_sha256"], str)
+        or not isinstance(value["raw_proof_sha256"], str)
+    ):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "invalid command result types")
+    executed_arguments = _string_tuple(value["executed_arguments"], "executed_arguments")
+    if not executed_arguments:
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "executed argv missing")
+    return GateResult(
+        value["adapter"],
+        _string_tuple(value["arguments"], "arguments"),
+        value["proof_kind"],
+        _string_tuple(value["observed_paths"], "observed_paths"),
+        _string_tuple(value["zero_statement_paths"], "zero_statement_paths"),
+        value["executed"],
+        value["exit_code"],
+        value["stderr_sha256"],
+        value["stdout_sha256"],
+        value["raw_proof_sha256"],
+        executed_arguments,
+    )
+
+
+def _asset_receipt(value: object) -> AssetReceipt:
+    keys = {"blob_sha256", "kind", "path", "result", "validator"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or any(not isinstance(value[field], str) for field in keys)
+        or not value["path"]
+        or re.fullmatch(r"[0-9a-f]{64}", value["blob_sha256"]) is None
+        or value["result"] not in ASSET_RESULTS
+    ):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "invalid asset receipt")
+    identity = ASSET_VALIDATORS.get(Path(value["path"]).suffix, UNSUPPORTED_ASSET_IDENTITY)
+    if (value["kind"], value["validator"]) != identity or (
+        value["result"] == "UNSUPPORTED"
+    ) is not (identity == UNSUPPORTED_ASSET_IDENTITY):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "invalid asset identity")
+    return AssetReceipt(
+        value["path"],
+        value["kind"],
+        value["validator"],
+        value["blob_sha256"],
+        value["result"],
+    )
+
+
+def _parse_evidence(data: object) -> QualityEvidence:
+    expected = {
+        "asset_receipts",
+        "base_sha",
+        "changed_paths",
+        "commands",
+        "exclusions",
+        "head_sha",
+        "high_risk_paths",
+        "language",
+        "maximum_complexity",
+        "production_files",
+        "source_files",
+        "test_files",
+        "production_paths",
+        "repository",
+        "repository_id",
+        "repository_remote",
+        "run_attempt",
+        "run_id",
+        "runner_environment",
+        "schema_version",
+        "workflow_sha",
+        "job",
+        "artifact_id",
+        "artifact_digest",
+        "capture_sha256",
+    }
+    if not isinstance(data, dict) or set(data) != expected:
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "quality evidence keys mismatch")
+    scalar_strings = (
+        "base_sha",
+        "head_sha",
+        "language",
+        "repository",
+        "repository_id",
+        "repository_remote",
+        "run_attempt",
+        "run_id",
+        "runner_environment",
+        "schema_version",
+        "workflow_sha",
+        "job",
+        "artifact_id",
+        "artifact_digest",
+        "capture_sha256",
+    )
+    if any(not isinstance(data[field], str) for field in scalar_strings):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "invalid quality identity")
+    if (
+        type(data["maximum_complexity"]) is not int
+        or not isinstance(data["commands"], list)
+        or not isinstance(data["asset_receipts"], list)
+    ):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "invalid quality values")
+    receipts = tuple(_asset_receipt(item) for item in data["asset_receipts"])
+    if tuple(sorted(receipts, key=lambda item: item.path)) != receipts or len(
+        {item.path for item in receipts}
+    ) != len(receipts):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "asset receipts not unique/sorted")
+    production = _string_tuple(data["production_files"], "production_files")
+    sources = _string_tuple(data["source_files"], "source_files")
+    tests = _string_tuple(data["test_files"], "test_files")
+    commands = tuple(_gate_result(item) for item in data["commands"])
+    if (
+        data["language"] not in SOURCE_SUFFIXES
+        or production != tuple(sorted(set(production)))
+        or sources != tuple(sorted(set(sources)))
+        or any(not path.endswith(SOURCE_SUFFIXES[data["language"]]) for path in sources)
+        or production != tuple(sorted((*sources, *(item.path for item in receipts))))
+        or any(
+            path not in sources
+            for command in commands
+            for path in (*command.observed_paths, *command.zero_statement_paths)
+        )
+    ):
+        raise QualityProfileError("MALFORMED_QUALITY_EVIDENCE", "invalid production partition")
+    return QualityEvidence(
+        data["base_sha"],
+        _string_tuple(data["changed_paths"], "changed_paths"),
+        commands,
+        _string_tuple(data["exclusions"], "exclusions"),
+        data["head_sha"],
+        _string_tuple(data["high_risk_paths"], "high_risk_paths"),
+        data["language"],
+        data["maximum_complexity"],
+        receipts,
+        production,
+        sources,
+        tests,
+        _string_tuple(data["production_paths"], "production_paths"),
+        data["repository"],
+        data["repository_id"],
+        data["repository_remote"],
+        data["run_attempt"],
+        data["run_id"],
+        data["runner_environment"],
+        data["schema_version"],
+        data["workflow_sha"],
+        data["job"],
+        data["artifact_id"],
+        data["artifact_digest"],
+        data["capture_sha256"],
+    )
+
+
+def load_evidence(path: Path) -> QualityEvidence:
+    """Load strict quality evidence without accepting unknown fields."""
+    try:
+        data = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise QualityProfileError("MISSING_QUALITY_EVIDENCE", str(error)) from error
+    return _parse_evidence(data)
+
+
+def _verify_artifact_metadata(
+    path: Path,
+    *,
+    repository: str,
+    repository_id: str,
+    run_id: str,
+    run_attempt: str,
+    artifact_id: str,
+    artifact_digest: str,
+    head_sha: str,
+) -> None:
+    try:
+        data = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise QualityProfileError("UNAUTHENTICATED_QUALITY_ARTIFACT", str(error)) from error
+    workflow = data.get("workflow_run") if isinstance(data, dict) else None
+    digest = data.get("digest") if isinstance(data, dict) else None
+    if isinstance(digest, str) and digest.startswith("sha256:"):
+        digest = digest.removeprefix("sha256:")
+    expected = (
+        int(artifact_id),
+        f"quality-profile-{run_id}-{run_attempt}",
+        False,
+        artifact_digest,
+        f"/repos/{repository}/actions/artifacts/{artifact_id}",
+        int(run_id),
+        int(repository_id),
+        head_sha,
+    )
+    actual = (
+        data.get("id") if isinstance(data, dict) else None,
+        data.get("name") if isinstance(data, dict) else None,
+        data.get("expired") if isinstance(data, dict) else None,
+        digest,
+        str(data.get("url", "")).removeprefix("https://api.github.com"),
+        workflow.get("id") if isinstance(workflow, dict) else None,
+        workflow.get("repository_id") if isinstance(workflow, dict) else None,
+        workflow.get("head_sha") if isinstance(workflow, dict) else None,
+    )
+    expires_at = data.get("expires_at") if isinstance(data, dict) else None
+    if actual != expected or not isinstance(expires_at, str) or not expires_at:
+        raise QualityProfileError(
+            "QUALITY_ARTIFACT_BINDING_MISMATCH", "GitHub artifact metadata mismatch"
+        )
+
+
+def verify_evidence_binding(
+    path: Path,
+    *,
+    metadata_path: Path,
+    repository: str,
+    repository_id: str,
+    run_id: str,
+    run_attempt: str,
+    job: str,
+    artifact_id: str,
+    artifact_digest: str,
+    capture_sha256: str,
+) -> QualityEvidence:
+    """Bind one downloaded artifact to expected API-read workflow metadata."""
+    try:
+        content = path.read_bytes()
+        evidence = _parse_evidence(json.loads(content))
+    except (OSError, json.JSONDecodeError) as error:
+        raise QualityProfileError("MISSING_QUALITY_EVIDENCE", str(error)) from error
+    expected = (repository, repository_id, run_id, run_attempt, job, "github-hosted")
+    actual = (
+        evidence.repository,
+        evidence.repository_id,
+        evidence.run_id,
+        evidence.run_attempt,
+        evidence.job,
+        evidence.runner_environment,
+    )
+    if actual != expected:
+        raise QualityProfileError("QUALITY_ARTIFACT_BINDING_MISMATCH", "artifact identity mismatch")
+    if any((evidence.artifact_id, evidence.artifact_digest, evidence.capture_sha256)):
+        raise QualityProfileError(
+            "SELF_DECLARED_QUALITY_ARTIFACT", "artifact metadata must be external"
+        )
+    if (
+        not artifact_id.isdigit()
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None
+        or _FULL_SHA.fullmatch(capture_sha256) is None
+        or len(capture_sha256) != 64
+        or _sha256(content) != capture_sha256
+    ):
+        raise QualityProfileError("UNAUTHENTICATED_QUALITY_ARTIFACT", "artifact proof mismatch")
+    _verify_artifact_metadata(
+        metadata_path,
+        repository=repository,
+        repository_id=repository_id,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        artifact_id=artifact_id,
+        artifact_digest=artifact_digest,
+        head_sha=evidence.head_sha,
+    )
+    return replace(
+        evidence,
+        artifact_id=artifact_id,
+        artifact_digest=artifact_digest,
+        capture_sha256=capture_sha256,
+    )
+
+
+def _changed_production_paths(
+    assessments: tuple[ChangedFileAssessment, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                path
+                for item in assessments
+                for path, production in (
+                    (item.change.old_path, item.base_production),
+                    (item.change.new_path, item.head_production),
+                )
+                if path and production
+            }
+        )
+    )
+
+
+def _moved_outside_scope(
+    assessments: tuple[ChangedFileAssessment, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            item.change.new_path
+            for item in assessments
+            if item.base_production
+            and not item.head_production
+            and item.change.new_path is not None
+        )
+    )
+
+
+def _changed_head_production_paths(
+    assessments: tuple[ChangedFileAssessment, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            item.change.new_path
+            for item in assessments
+            if item.head_production and item.change.new_path is not None
+        )
+    )
+
+
+def _verify_evidence_identity(
+    evidence: QualityEvidence,
+    policy: contract.Contract,
+    identity: git_changes.RepositoryIdentity,
+    workflow_sha: str,
+) -> None:
+    if _FULL_SHA.fullmatch(workflow_sha) is None:
+        raise QualityProfileError("INVALID_WORKFLOW_SHA", "workflow SHA must be immutable")
+    expected_identity = (
+        identity.remote,
+        identity.base_sha,
+        identity.head_sha,
+        policy.language,
+        workflow_sha,
+    )
+    actual_identity = (
+        evidence.repository_remote,
+        evidence.base_sha,
+        evidence.head_sha,
+        evidence.language,
+        evidence.workflow_sha,
+    )
+    if actual_identity != expected_identity:
+        raise QualityProfileError("QUALITY_EVIDENCE_BINDING_MISMATCH", "quality identity mismatch")
+    if evidence.schema_version != SCHEMA_VERSION or evidence.runner_environment != "github-hosted":
+        raise QualityProfileError("UNTRUSTED_QUALITY_ENVIRONMENT", "untrusted quality runtime")
+    if (
+        not evidence.artifact_id.isdigit()
+        or re.fullmatch(r"[0-9a-f]{64}", evidence.artifact_digest) is None
+        or len(evidence.capture_sha256) != 64
+        or _FULL_SHA.fullmatch(evidence.capture_sha256) is None
+    ):
+        raise QualityProfileError("UNAUTHENTICATED_QUALITY_ARTIFACT", "artifact proof missing")
+
+
+def _covers(result: GateResult, path: str) -> bool:
+    return path in result.observed_paths or path in result.zero_statement_paths
+
+
+def _command_exit_block(language: str, result: GateResult) -> str | None:
+    profile = result.adapter.split(".", 1)[0] if language == "mixed" else language
+    if result.exit_code == 1 and contract.POLICY_EXIT_STANDARDS[profile].get(result.adapter) == 3:
+        return f"ARCHITECTURE_GATE_FAILED:{result.adapter}"
+    if contract.command_failed(language, result.adapter, result.executed, result.exit_code):
+        return f"QUALITY_GATE_FAILED:{result.adapter}"
+    return None
+
+
+def _command_coverage_blocks(
+    adapter: str,
+    result: GateResult,
+    changed_paths: tuple[str, ...],
+    high_risk_paths: tuple[str, ...],
+) -> list[str]:
+    if result.proof_kind == "provisioning":
+        return []
+    profile = adapter.split(".", 1)[0]
+    applicable_changed = tuple(
+        path for path in changed_paths if path.endswith(SOURCE_SUFFIXES[profile])
+    )
+    applicable_high_risk = tuple(
+        path for path in high_risk_paths if path.endswith(SOURCE_SUFFIXES[profile])
+    )
+    return [
+        *(
+            f"QUALITY_CHANGED_FILE_COVERAGE:{adapter}:{path}"
+            for path in applicable_changed
+            if not _covers(result, path)
+        ),
+        *(
+            f"QUALITY_HIGH_RISK_FILE_COVERAGE:{adapter}:{path}"
+            for path in applicable_high_risk
+            if not _covers(result, path)
+        ),
+    ]
+
+
+def _test_coverage_blocks(
+    policy: contract.Contract,
+    commands: dict[str, GateResult],
+    changed_paths: tuple[str, ...],
+    high_risk_paths: tuple[str, ...],
+) -> list[str]:
+    blocks: list[str] = []
+    for profile, test_adapter in (
+        ("python", "python.pytest.v1"),
+        ("typescript", "typescript.test.v1"),
+    ):
+        if profile not in policy.languages or (test_result := commands.get(test_adapter)) is None:
+            continue
+        blocks.extend(
+            f"UNTESTED_AREA:{path}"
+            for path in sorted(set((*changed_paths, *high_risk_paths)))
+            if path.endswith(SOURCE_SUFFIXES[profile]) and not _covers(test_result, path)
+        )
+    return blocks
+
+
+def _command_blocks(
+    evidence: QualityEvidence,
+    policy: contract.Contract,
+    changed_paths: tuple[str, ...],
+    high_risk_paths: tuple[str, ...],
+) -> list[str]:
+    templates = command_templates(policy.language)
+    expected = dict(templates)
+    commands = {item.adapter: item for item in evidence.commands}
+    if len(commands) != len(evidence.commands):
+        raise QualityProfileError("DUPLICATE_QUALITY_COMMAND", "duplicate quality command")
+    expected_order = tuple(adapter for adapter, _arguments in templates)
+    observed_order = tuple(item.adapter for item in evidence.commands)
+    blocked_prefix = (
+        bool(evidence.commands)
+        and observed_order == expected_order[: len(observed_order)]
+        and contract.command_failed(
+            policy.language,
+            evidence.commands[-1].adapter,
+            evidence.commands[-1].executed,
+            evidence.commands[-1].exit_code,
+        )
+    )
+    blocks = (
+        []
+        if blocked_prefix
+        else [
+            f"MISSING_QUALITY_COMMAND:{adapter}" for adapter in expected if adapter not in commands
+        ]
+    )
+    blocks.extend(
+        f"UNAPPROVED_QUALITY_COMMAND:{adapter}" for adapter in sorted(set(commands) - set(expected))
+    )
+    for adapter, arguments in expected.items():
+        result = commands.get(adapter)
+        if result is None:
+            continue
+        if result.arguments != arguments:
+            blocks.append(f"QUALITY_COMMAND_VECTOR_MISMATCH:{adapter}")
+        if result.proof_kind != expected_proof_kind(adapter):
+            blocks.append(f"QUALITY_PROOF_KIND_MISMATCH:{adapter}")
+        if not result.executed:
+            blocks.append(f"DECLARED_TOOL_NOT_EXECUTED:{adapter}")
+        elif exit_block := _command_exit_block(policy.language, result):
+            blocks.append(exit_block)
+        blocks.extend(_command_coverage_blocks(adapter, result, changed_paths, high_risk_paths))
+    blocks.extend(_test_coverage_blocks(policy, commands, changed_paths, high_risk_paths))
+    return blocks
+
+
+def _policy_blocks(
+    evidence: QualityEvidence,
+    policy: contract.Contract,
+    assessments: tuple[ChangedFileAssessment, ...],
+    production_files: tuple[str, ...],
+    source_files: tuple[str, ...],
+    asset_receipts: tuple[AssetReceipt, ...],
+    test_files: tuple[str, ...],
+) -> list[str]:
+    blocks: list[str] = []
+    if evidence.production_files != production_files:
+        blocks.append("QUALITY_PRODUCTION_MANIFEST_MISMATCH")
+    if evidence.test_files != test_files:
+        blocks.append("QUALITY_TEST_MANIFEST_MISMATCH")
+    if evidence.source_files != source_files:
+        blocks.append("QUALITY_SOURCE_MANIFEST_MISMATCH")
+    if evidence.asset_receipts != asset_receipts:
+        blocks.append("QUALITY_ASSET_RECEIPT_MISMATCH")
+    if production_files != tuple(sorted((*source_files, *(item.path for item in asset_receipts)))):
+        blocks.append("QUALITY_PRODUCTION_PARTITION_MISMATCH")
+    blocks.extend(
+        f"MALFORMED_PRODUCTION_ASSET:{item.path}"
+        for item in asset_receipts
+        if item.result == "MALFORMED"
+    )
+    blocks.extend(
+        f"UNSUPPORTED_PRODUCTION_ASSET:{item.path}"
+        for item in asset_receipts
+        if item.result == "UNSUPPORTED"
+    )
+    changed_paths = _changed_production_paths(assessments)
+    if evidence.production_paths != policy.production_paths:
+        blocks.append("QUALITY_SCOPE_NARROWING")
+    if evidence.maximum_complexity > policy.maximum:
+        blocks.append("QUALITY_THRESHOLD_WEAKENING")
+    elif evidence.maximum_complexity != policy.maximum:
+        blocks.append("QUALITY_THRESHOLD_MISMATCH")
+    blocks.extend(suppression_policy_blocks(evidence.exclusions))
+    blocks.extend(
+        f"PRODUCTION_PATH_MOVED_OUTSIDE_SCOPE:{path}" for path in _moved_outside_scope(assessments)
+    )
+    head_paths = _changed_head_production_paths(assessments)
+    blocks.extend(
+        f"QUALITY_CHANGED_FILE_NOT_ATTESTED:{path}"
+        for path in head_paths
+        if path not in evidence.production_files
+    )
+    blocks.extend(
+        f"QUALITY_HIGH_RISK_FILE_NOT_ATTESTED:{path}"
+        for path in policy.high_risk_paths
+        if path not in evidence.production_files
+    )
+    if (
+        evidence.changed_paths != changed_paths
+        or evidence.high_risk_paths != policy.high_risk_paths
+    ):
+        blocks.append("QUALITY_COVERAGE_MAPPING_MISMATCH")
+    return blocks
+
+
+def evidence_blocks(
+    evidence: QualityEvidence,
+    policy: contract.Contract,
+    identity: git_changes.RepositoryIdentity,
+    assessments: tuple[ChangedFileAssessment, ...],
+    production_files: tuple[str, ...],
+    source_files: tuple[str, ...],
+    asset_receipts: tuple[AssetReceipt, ...],
+    test_files: tuple[str, ...],
+    workflow_sha: str,
+) -> tuple[str, ...]:
+    """Bind exact attestation identity and return deterministic quality blocks."""
+    _verify_evidence_identity(evidence, policy, identity, workflow_sha)
+    changed_paths = tuple(
+        path for path in _changed_head_production_paths(assessments) if path in source_files
+    )
+    high_risk_paths = tuple(path for path in policy.high_risk_paths if path in source_files)
+    blocks = _command_blocks(evidence, policy, changed_paths, high_risk_paths)
+    blocks.extend(
+        _policy_blocks(
+            evidence,
+            policy,
+            assessments,
+            production_files,
+            source_files,
+            asset_receipts,
+            test_files,
+        )
+    )
+    return tuple(sorted(set(blocks)))
+
+
+def write_evidence(evidence: QualityEvidence, output: Path) -> bytes:
+    """Write byte-stable attestation JSON."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(asdict(evidence), indent=2, sort_keys=True) + "\n").encode()
+    output.write_bytes(payload)
+    return payload
+
+
+def decision_payload(evidence: QualityEvidence) -> dict[str, object]:
+    """Return only inputs and observations that define the deterministic decision."""
+    commands = [
+        {
+            "adapter": item.adapter,
+            "arguments": list(item.arguments),
+            "executed": item.executed,
+            "exit_code": item.exit_code,
+            "observed_paths": list(item.observed_paths),
+            "proof_kind": item.proof_kind,
+            "zero_statement_paths": list(item.zero_statement_paths),
+        }
+        for item in evidence.commands
+    ]
+    return {
+        "base_sha": evidence.base_sha,
+        "changed_paths": list(evidence.changed_paths),
+        "commands": commands,
+        "exclusions": list(evidence.exclusions),
+        "head_sha": evidence.head_sha,
+        "high_risk_paths": list(evidence.high_risk_paths),
+        "language": evidence.language,
+        "maximum_complexity": evidence.maximum_complexity,
+        "asset_receipts": [asdict(item) for item in evidence.asset_receipts],
+        "production_files": list(evidence.production_files),
+        "source_files": list(evidence.source_files),
+        "test_files": list(evidence.test_files),
+        "production_paths": list(evidence.production_paths),
+        "repository_remote": evidence.repository_remote,
+        "schema_version": evidence.schema_version,
+        "workflow_sha": evidence.workflow_sha,
+    }
+
+
+def provenance_payload(evidence: QualityEvidence) -> dict[str, object]:
+    """Return run-specific artifact and raw-proof identities."""
+    return {
+        "artifact_digest": evidence.artifact_digest,
+        "artifact_id": evidence.artifact_id,
+        "capture_sha256": evidence.capture_sha256,
+        "commands": [
+            {
+                "adapter": item.adapter,
+                "executed_arguments": list(item.executed_arguments),
+                "raw_proof_sha256": item.raw_proof_sha256,
+                "stderr_sha256": item.stderr_sha256,
+                "stdout_sha256": item.stdout_sha256,
+            }
+            for item in evidence.commands
+        ],
+        "job": evidence.job,
+        "repository": evidence.repository,
+        "repository_id": evidence.repository_id,
+        "run_attempt": evidence.run_attempt,
+        "run_id": evidence.run_id,
+        "runner_environment": evidence.runner_environment,
+    }

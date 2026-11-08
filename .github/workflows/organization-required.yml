@@ -1,0 +1,766 @@
+name: Organization Required Supportability Gate
+
+on:
+  pull_request:
+
+concurrency:
+  group: supportability-capture-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  characterize-base:
+    name: Characterize Base
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      capture-outcome: ${{ steps.capture.outcome }}
+      capture-sha256: ${{ steps.capture.outputs.sha256 }}
+    steps:
+      - name: Check out characterization definitions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: definition
+
+      - name: Check out exact target base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: target
+
+      - name: Check out exact gate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: gate
+
+      - name: Set up Python 3.12.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Set up Node.js 24.20.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24.20.0"
+          package-manager-cache: false
+
+      - name: Install exact characterization dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r gate/requirements-dev.lock
+
+      - name: Capture exact base behavior twice
+        id: capture
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTHONPATH: ${{ github.workspace }}/gate/src
+          RUNNER_ENVIRONMENT: github-hosted
+        run: |
+          set +e
+          export RUNNER_ENVIRONMENT=github-hosted
+          mkdir -p "$RUNNER_TEMP/base"
+          python -P "$GITHUB_WORKSPACE/gate/tests/hosted_characterization.py" \
+            --target-repository "$GITHUB_WORKSPACE/target" \
+            --definition-repository "$GITHUB_WORKSPACE/definition" \
+            --base-ref "$BASE_SHA" \
+            --head-ref "$HEAD_SHA" \
+            --side base \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --job characterize-base \
+            --output "$RUNNER_TEMP/base/characterization.json"
+          status=$?
+          if [ -f "$RUNNER_TEMP/base/characterization.json" ]; then
+            echo "sha256=$(sha256sum "$RUNNER_TEMP/base/characterization.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha256=" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Upload authenticated base behavior
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: characterization-base-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/base
+          if-no-files-found: error
+
+      - name: Report capture failure after retaining evidence
+        if: ${{ always() && steps.capture.outcome != 'success' }}
+        run: exit 1
+
+  characterize-head:
+    name: Characterize Head
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      capture-outcome: ${{ steps.capture.outcome }}
+      capture-sha256: ${{ steps.capture.outputs.sha256 }}
+    steps:
+      - name: Check out characterization definitions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: definition
+
+      - name: Check out exact target head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: target
+
+      - name: Check out exact gate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: gate
+
+      - name: Set up Python 3.12.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Set up Node.js 24.20.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24.20.0"
+          package-manager-cache: false
+
+      - name: Install exact characterization dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r gate/requirements-dev.lock
+
+      - name: Capture exact head behavior twice
+        id: capture
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTHONPATH: ${{ github.workspace }}/gate/src
+          RUNNER_ENVIRONMENT: github-hosted
+        run: |
+          set +e
+          export RUNNER_ENVIRONMENT=github-hosted
+          mkdir -p "$RUNNER_TEMP/head"
+          python -P "$GITHUB_WORKSPACE/gate/tests/hosted_characterization.py" \
+            --target-repository "$GITHUB_WORKSPACE/target" \
+            --definition-repository "$GITHUB_WORKSPACE/definition" \
+            --base-ref "$BASE_SHA" \
+            --head-ref "$HEAD_SHA" \
+            --side head \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --job characterize-head \
+            --output "$RUNNER_TEMP/head/characterization.json"
+          status=$?
+          if [ -f "$RUNNER_TEMP/head/characterization.json" ]; then
+            echo "sha256=$(sha256sum "$RUNNER_TEMP/head/characterization.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha256=" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Upload authenticated head behavior
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: characterization-head-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/head
+          if-no-files-found: error
+
+      - name: Report capture failure after retaining evidence
+        if: ${{ always() && steps.capture.outcome != 'success' }}
+        run: exit 1
+
+  quality-profile-shards:
+    name: Quality Profile (Partition ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      capture-outcome: ${{ steps.capture.outcome }}
+      capture-sha256: ${{ steps.capture.outputs.sha256 }}
+    steps:
+      - name: Check out exact target head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: target
+
+      - name: Check out exact gate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: gate
+
+      - name: Set up Python 3.12.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Set up Node.js 24.20.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24.20.0"
+          package-manager-cache: false
+
+      - name: Install exact quality runner dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r gate/requirements-dev.lock
+
+      - name: Capture fixed stack-native quality profile
+        id: capture
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTHONPATH: ${{ github.workspace }}/gate/src
+          RUNNER_ENVIRONMENT: github-hosted
+        run: |
+          set +e
+          export RUNNER_ENVIRONMENT=github-hosted
+          mkdir -p "$RUNNER_TEMP/quality"
+          python -P "$GITHUB_WORKSPACE/gate/tests/hosted_quality_profile.py" \
+            --repository "$GITHUB_WORKSPACE/target" \
+            --repository-name "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --base-ref "$BASE_SHA" \
+            --head-ref "$HEAD_SHA" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --pytest-shard-index "${{ matrix.shard }}" \
+            --pytest-shard-count "4" \
+            --output "$RUNNER_TEMP/quality/quality-gates.json"
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ -f "$RUNNER_TEMP/quality/quality-gates.json" ]; then
+            echo "sha256=$(sha256sum "$RUNNER_TEMP/quality/quality-gates.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha256=" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Upload authenticated quality evidence
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: quality-profile-shard-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quality
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Report quality failure after retaining evidence
+        if: ${{ always() && steps.capture.outcome != 'success' }}
+        run: exit 1
+
+  deterministic-evidence:
+    name: Deterministic Supportability Evidence
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact-digest: ${{ steps.upload_evidence.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload_evidence.outputs.artifact-id }}
+    steps:
+      - name: Check out target pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: target
+
+      - name: Check out exact gate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: gate
+
+      - name: Set up Python 3.12.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Install exact gate
+        id: install
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/raw"
+          set +e
+          {
+            python -m venv "$RUNNER_TEMP/gate-venv" &&
+            "$RUNNER_TEMP/gate-venv/bin/python" -m pip install --disable-pip-version-check --require-hashes -r gate/requirements-dev.lock &&
+            "$RUNNER_TEMP/gate-venv/bin/python" -m pip install --disable-pip-version-check --no-build-isolation --no-deps ./gate
+          } >"$RUNNER_TEMP/raw/install.stdout.log" 2>"$RUNNER_TEMP/raw/install.stderr.log"
+          status=$?
+          cat "$RUNNER_TEMP/raw/install.stdout.log"
+          cat "$RUNNER_TEMP/raw/install.stderr.log" >&2
+          exit "$status"
+
+      - name: Await exact producer jobs and native artifact identities
+        id: await_capture
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python -P "$GITHUB_WORKSPACE/gate/tests/hosted_artifact_wait.py" capture >> "$GITHUB_OUTPUT"
+
+      - name: Download authenticated base behavior
+        id: download_base
+        if: steps.await_capture.outputs.base-artifact-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ steps.await_capture.outputs.base-artifact-id }}
+          path: ${{ runner.temp }}/base
+
+      - name: Download authenticated head behavior
+        id: download_head
+        if: steps.await_capture.outputs.head-artifact-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ steps.await_capture.outputs.head-artifact-id }}
+          path: ${{ runner.temp }}/head
+
+      - name: Verify exact behavior characterization
+        id: characterization
+        if: >-
+          steps.install.outcome == 'success' &&
+          steps.download_base.outcome == 'success' &&
+          steps.download_head.outcome == 'success'
+        continue-on-error: true
+        env:
+          BASE_ARTIFACT_DIGEST: ${{ steps.await_capture.outputs.base-artifact-digest }}
+          BASE_ARTIFACT_ID: ${{ steps.await_capture.outputs.base-artifact-id }}
+          BASE_CAPTURE_SHA256: ${{ steps.await_capture.outputs.base-capture-sha256 }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_ARTIFACT_DIGEST: ${{ steps.await_capture.outputs.head-artifact-digest }}
+          HEAD_ARTIFACT_ID: ${{ steps.await_capture.outputs.head-artifact-id }}
+          HEAD_CAPTURE_SHA256: ${{ steps.await_capture.outputs.head-capture-sha256 }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUNNER_ENVIRONMENT: github-hosted
+        working-directory: ${{ runner.temp }}
+        run: |
+          set +e
+          export RUNNER_ENVIRONMENT=github-hosted
+          "$RUNNER_TEMP/gate-venv/bin/python" -P -m supportability_gate.characterization verify \
+            --repository "$GITHUB_WORKSPACE/target" \
+            --repository-name "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --base-ref "$BASE_SHA" \
+            --head-ref "$HEAD_SHA" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --base-evidence "$RUNNER_TEMP/base/characterization.json" \
+            --head-evidence "$RUNNER_TEMP/head/characterization.json" \
+            --base-artifact-id "$BASE_ARTIFACT_ID" \
+            --base-artifact-digest "$BASE_ARTIFACT_DIGEST" \
+            --base-capture-sha256 "$BASE_CAPTURE_SHA256" \
+            --head-artifact-id "$HEAD_ARTIFACT_ID" \
+            --head-artifact-digest "$HEAD_ARTIFACT_DIGEST" \
+            --head-capture-sha256 "$HEAD_CAPTURE_SHA256" \
+            --output "$RUNNER_TEMP/evidence/characterization-result.json" \
+            >"$RUNNER_TEMP/raw/characterization.stdout.log" \
+            2>"$RUNNER_TEMP/raw/characterization.stderr.log"
+          status=$?
+          cat "$RUNNER_TEMP/raw/characterization.stdout.log"
+          cat "$RUNNER_TEMP/raw/characterization.stderr.log" >&2
+          if [ -f "$RUNNER_TEMP/evidence/characterization-result.json" ]; then
+            cat "$RUNNER_TEMP/evidence/characterization-result.json"
+          fi
+          exit "$status"
+
+      - name: Verify runnable work and frozen correction evidence
+        id: refactor_policy
+        if: >-
+          steps.install.outcome == 'success' &&
+          steps.download_base.outcome == 'success' &&
+          steps.download_head.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}
+        run: |
+          set +e
+          export RUNNER_ENVIRONMENT=github-hosted
+          "$RUNNER_TEMP/gate-venv/bin/python" -P -m supportability_gate.refactor_policy \
+            --repository "$GITHUB_WORKSPACE/target" \
+            --event "$GITHUB_EVENT_PATH" \
+            --characterization-result "$RUNNER_TEMP/evidence/characterization-result.json" \
+            --output "$RUNNER_TEMP/evidence/refactor-policy-result.json" \
+            >"$RUNNER_TEMP/raw/refactor.stdout.log" \
+            2>"$RUNNER_TEMP/raw/refactor.stderr.log"
+          status=$?
+          cat "$RUNNER_TEMP/raw/refactor.stdout.log"
+          cat "$RUNNER_TEMP/raw/refactor.stderr.log" >&2
+          if [ -f "$RUNNER_TEMP/evidence/refactor-policy-result.json" ]; then
+            cat "$RUNNER_TEMP/evidence/refactor-policy-result.json"
+          fi
+          exit "$status"
+
+      - name: Await all exact quality partitions
+        id: await_quality
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python -P "$GITHUB_WORKSPACE/gate/tests/hosted_artifact_wait.py" quality
+
+      - name: Capture fixed stack-native quality profile
+        id: aggregate_quality
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTHONPATH: ${{ github.workspace }}/gate/src
+          RUNNER_ENVIRONMENT: github-hosted
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          export RUNNER_ENVIRONMENT=github-hosted
+          mkdir -p "$RUNNER_TEMP/quality"
+          "$RUNNER_TEMP/gate-venv/bin/python" -P "$GITHUB_WORKSPACE/gate/tests/hosted_quality_aggregate.py" \
+            --repository "$GITHUB_WORKSPACE/target" \
+            --repository-name "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --base-ref "$BASE_SHA" \
+            --head-ref "$HEAD_SHA" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --pytest-shard-count "4" \
+            --output "$RUNNER_TEMP/quality/quality-gates.json"
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ -f "$RUNNER_TEMP/quality/quality-gates.json" ]; then
+            echo "sha256=$(sha256sum "$RUNNER_TEMP/quality/quality-gates.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha256=" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Upload authenticated quality evidence
+        id: upload_quality
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: quality-profile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quality
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Download authenticated quality evidence
+        id: download_quality
+        if: steps.upload_quality.outputs.artifact-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ steps.upload_quality.outputs.artifact-id }}
+          path: ${{ runner.temp }}/quality
+
+      - name: Read back GitHub artifact metadata
+        id: artifact_metadata
+        if: steps.download_quality.outcome == 'success'
+        continue-on-error: true
+        env:
+          ARTIFACT_ID: ${{ steps.upload_quality.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" \
+            --output "$RUNNER_TEMP/quality/artifact-metadata.json"
+
+      - name: Evaluate immutable pull-request commits
+        id: evaluate
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          QUALITY_ARTIFACT_DIGEST: ${{ steps.upload_quality.outputs.artifact-digest }}
+          QUALITY_ARTIFACT_ID: ${{ steps.upload_quality.outputs.artifact-id }}
+          QUALITY_CAPTURE_SHA256: ${{ steps.aggregate_quality.outputs.sha256 }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set +e
+          "$RUNNER_TEMP/gate-venv/bin/python" -P -m supportability_gate evaluate-complexity \
+            --repository "$GITHUB_WORKSPACE/target" \
+            --base-ref "$BASE_SHA" \
+            --head-ref "$HEAD_SHA" \
+            --contract-path .supportability.toml \
+            --quality-evidence "$RUNNER_TEMP/quality/quality-gates.json" \
+            --quality-repository "$GITHUB_REPOSITORY" \
+            --quality-repository-id "$GITHUB_REPOSITORY_ID" \
+            --quality-run-id "$GITHUB_RUN_ID" \
+            --quality-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --quality-job quality-profile \
+            --quality-artifact-id "$QUALITY_ARTIFACT_ID" \
+            --quality-artifact-digest "$QUALITY_ARTIFACT_DIGEST" \
+            --quality-artifact-metadata "$RUNNER_TEMP/quality/artifact-metadata.json" \
+            --quality-capture-sha256 "$QUALITY_CAPTURE_SHA256" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --output-directory "$RUNNER_TEMP/evidence" \
+            >"$RUNNER_TEMP/raw/complexity.stdout.log" \
+            2>"$RUNNER_TEMP/raw/complexity.stderr.log"
+          status=$?
+          cat "$RUNNER_TEMP/raw/complexity.stdout.log"
+          cat "$RUNNER_TEMP/raw/complexity.stderr.log" >&2
+          if [ -f "$RUNNER_TEMP/evidence/complexity-result.json" ]; then
+            cat "$RUNNER_TEMP/evidence/complexity-result.json"
+          fi
+          exit "$status"
+
+      - name: Compose eight independently enforceable results
+        id: standard_results
+        if: always()
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTHONPATH: ${{ github.workspace }}/gate/src
+        run: |
+          set +e
+          python -P -m supportability_gate.standard_results_producer \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --install-outcome "${{ steps.install.outcome }}" \
+            --complexity-outcome "${{ steps.evaluate.outcome }}" \
+            --characterization-outcome "${{ steps.characterization.outcome }}" \
+            --refactor-outcome "${{ steps.refactor_policy.outcome }}" \
+            --quality-outcome "${{ steps.aggregate_quality.outcome != 'success' && steps.aggregate_quality.outcome || steps.download_quality.outcome != 'success' && steps.download_quality.outcome || steps.artifact_metadata.outcome }}" \
+            --install-failure-code "GATE_INSTALL_FAILED" \
+            --complexity-failure-code "COMPLEXITY_EVALUATION_FAILED" \
+            --characterization-failure-code "${{ steps.await_capture.outputs.base-capture-outcome != 'success' && 'BASE_CHARACTERIZATION_CAPTURE_FAILED' || steps.await_capture.outputs.head-capture-outcome != 'success' && 'HEAD_CHARACTERIZATION_CAPTURE_FAILED' || steps.download_base.outcome != 'success' && 'BASE_CHARACTERIZATION_DOWNLOAD_FAILED' || steps.download_head.outcome != 'success' && 'HEAD_CHARACTERIZATION_DOWNLOAD_FAILED' || 'CHARACTERIZATION_VERIFY_FAILED' }}" \
+            --refactor-failure-code "REFACTOR_POLICY_FAILED" \
+            --quality-failure-code "${{ steps.aggregate_quality.outcome != 'success' && 'QUALITY_PROFILE_FAILED' || steps.download_quality.outcome != 'success' && 'QUALITY_ARTIFACT_DOWNLOAD_FAILED' || steps.artifact_metadata.outcome != 'success' && 'QUALITY_ARTIFACT_METADATA_FAILED' || 'QUALITY_SOURCE_FAILED' }}" \
+            --expected-base-characterization-artifact-id "${{ steps.await_capture.outputs.base-artifact-id }}" \
+            --expected-base-characterization-artifact-digest "${{ steps.await_capture.outputs.base-artifact-digest }}" \
+            --expected-base-characterization-capture-sha256 "${{ steps.await_capture.outputs.base-capture-sha256 }}" \
+            --expected-head-characterization-artifact-id "${{ steps.await_capture.outputs.head-artifact-id }}" \
+            --expected-head-characterization-artifact-digest "${{ steps.await_capture.outputs.head-artifact-digest }}" \
+            --expected-head-characterization-capture-sha256 "${{ steps.await_capture.outputs.head-capture-sha256 }}" \
+            --expected-quality-artifact-id "${{ steps.upload_quality.outputs.artifact-id }}" \
+            --expected-quality-artifact-digest "${{ steps.upload_quality.outputs.artifact-digest }}" \
+            --expected-quality-capture-sha256 "${{ steps.aggregate_quality.outputs.sha256 }}" \
+            --complexity-result "$RUNNER_TEMP/evidence/complexity-result.json" \
+            --characterization-result "$RUNNER_TEMP/evidence/characterization-result.json" \
+            --refactor-result "$RUNNER_TEMP/evidence/refactor-policy-result.json" \
+            --quality-provenance "$RUNNER_TEMP/evidence/quality-provenance.json" \
+            --characterization-diagnostic "$RUNNER_TEMP/base/diagnostics/characterization-base--stage.json" \
+            --characterization-diagnostic "$RUNNER_TEMP/head/diagnostics/characterization-head--stage.json" \
+            --quality-diagnostic "$RUNNER_TEMP/quality/diagnostics/quality-profile--stage.json" \
+            --install-stdout-log "$RUNNER_TEMP/raw/install.stdout.log" \
+            --install-stderr-log "$RUNNER_TEMP/raw/install.stderr.log" \
+            --complexity-stdout-log "$RUNNER_TEMP/raw/complexity.stdout.log" \
+            --complexity-stderr-log "$RUNNER_TEMP/raw/complexity.stderr.log" \
+            --characterization-stdout-log "$RUNNER_TEMP/raw/characterization.stdout.log" \
+            --characterization-stderr-log "$RUNNER_TEMP/raw/characterization.stderr.log" \
+            --refactor-stdout-log "$RUNNER_TEMP/raw/refactor.stdout.log" \
+            --refactor-stderr-log "$RUNNER_TEMP/raw/refactor.stderr.log" \
+            --output "$RUNNER_TEMP/evidence/standard-results.json"
+          status=$?
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          cat "$RUNNER_TEMP/evidence/standard-results.json"
+
+      - name: Build compact qualification bundle
+        id: qualification_bundle
+        if: ${{ always() && steps.standard_results.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          "$RUNNER_TEMP/gate-venv/bin/python" -P -m supportability_gate.qualification_bundle build \
+            --evidence-directory "$RUNNER_TEMP/evidence" \
+            --output "$RUNNER_TEMP/evidence/qualification-bundle.zip"
+
+      - name: Restore qualification bundle without network access
+        id: restore_bundle
+        if: ${{ always() && steps.qualification_bundle.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --memory 2g \
+            --cpus 2 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            --volume "$RUNNER_TEMP/gate-venv:/gate-venv:ro" \
+            --volume "/opt/hostedtoolcache:/opt/hostedtoolcache:ro" \
+            --volume "$RUNNER_TEMP/evidence:/bundle:ro" \
+            ubuntu@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4 \
+            /gate-venv/bin/python -P -m supportability_gate.qualification_bundle restore \
+            --bundle /bundle/qualification-bundle.zip
+
+      - name: Upload authoritative supportability evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: supportability-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+
+      - name: Require authoritative result artifact
+        if: always()
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload_evidence.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.upload_evidence.outputs.artifact-id }}
+          QUALIFICATION_BUNDLE_OUTCOME: ${{ steps.qualification_bundle.outcome }}
+          RESTORE_BUNDLE_OUTCOME: ${{ steps.restore_bundle.outcome }}
+          STANDARD_RESULTS_OUTCOME: ${{ steps.standard_results.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload_evidence.outcome }}
+        run: |
+          status=0
+          for result in "$STANDARD_RESULTS_OUTCOME" "$QUALIFICATION_BUNDLE_OUTCOME" "$RESTORE_BUNDLE_OUTCOME" "$UPLOAD_OUTCOME"; do
+            if [ "$result" != "success" ]; then status=1; fi
+          done
+          if ! [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then status=1; fi
+          if ! [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then status=1; fi
+          exit "$status"
+
+  standard-results:
+    name: Publish Supportability Results
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+    steps:
+      - name: Check out exact gate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: gate
+
+      - name: Set up Python 3.12.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Await exact producer jobs and native artifact identities
+        id: await_evidence
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python -P "$GITHUB_WORKSPACE/gate/tests/hosted_artifact_wait.py" publish >> "$GITHUB_OUTPUT"
+
+      - name: Download exact authoritative evidence artifact
+        id: download
+        if: steps.await_evidence.outputs.evidence-artifact-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ steps.await_evidence.outputs.evidence-artifact-id }}
+          path: ${{ runner.temp }}/evidence
+
+      - name: Enforce and publish all Standard results
+        if: always()
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTHONPATH: ${{ github.workspace }}/gate/src:${{ github.workspace }}/gate/tests
+        run: |
+          set +e
+          overall=0
+          mkdir -p "$RUNNER_TEMP/results"
+          for standard in 1 2 3 4 5 6 7 8; do
+            result="$RUNNER_TEMP/results/standard-$standard.txt"
+            if [ "$DOWNLOAD_OUTCOME" != "success" ]; then
+              printf '%s\n' 'MISSING_STANDARD_RESULTS_ARTIFACT' > "$result"
+              result_status=2
+            else
+              python -P -m supportability_gate.standard_results_enforcer \
+                --repository "$GITHUB_REPOSITORY" \
+                --repository-id "$GITHUB_REPOSITORY_ID" \
+                --base-sha "$BASE_SHA" \
+                --head-sha "$HEAD_SHA" \
+                --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+                --run-id "$GITHUB_RUN_ID" \
+                --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --input "$RUNNER_TEMP/evidence/standard-results.json" \
+                --complexity-result "$RUNNER_TEMP/evidence/complexity-result.json" \
+                --quality-provenance "$RUNNER_TEMP/evidence/quality-provenance.json" \
+                --standard "$standard" \
+                --github-summary \
+                > "$result"
+              result_status=$?
+            fi
+            cat "$result"
+            python -P "$GITHUB_WORKSPACE/gate/tests/hosted_check_publisher.py" \
+              --repository "$GITHUB_REPOSITORY" \
+              --head-sha "$HEAD_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --standard "$standard" \
+              --result-exit-code "$result_status" \
+              --evidence-directory "$RUNNER_TEMP/evidence" \
+              --base-sha "$BASE_SHA" \
+              --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+              --repository-id "$GITHUB_REPOSITORY_ID" \
+              --summary "$result"
+            publish_status=$?
+            if [ "$publish_status" -ne 0 ]; then
+              overall=2
+            elif [ "$result_status" -ne 0 ] && [ "$overall" -eq 0 ]; then
+              overall=1
+            fi
+          done
+          exit "$overall"
